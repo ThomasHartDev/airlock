@@ -1,0 +1,42 @@
+{
+  "name": "airlock",
+  "version": "0.1.0",
+  "description": "Ephemeral, zero-credential, self-verifying execution for untrusted or agent-written code.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "keywords": [
+    "sandbox",
+    "isolate",
+    "untrusted-code",
+    "agent-safety",
+    "capability-security",
+    "typescript"
+  ],
+  "license": "MIT",
+  "packageManager": "pnpm@9.15.0",
+  "devDependencies": {
+    "@types/node": "^20.17.10",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
