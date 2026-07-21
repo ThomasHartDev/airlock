@@ -1,4 +1,9 @@
-export type RunStatus = "ok" | "timeout" | "assertion-failed" | "error";
+export type RunStatus =
+  | "ok"
+  | "timeout"
+  | "assertion-failed"
+  | "error"
+  | "out-of-memory";
 
 /**
  * A run only counts as verified when it carries `status: "ok"`. Every other
@@ -9,7 +14,8 @@ export type RunResult<T> =
   | { status: "ok"; value: T; durationMs: number }
   | { status: "timeout"; timeoutMs: number }
   | { status: "assertion-failed"; value: T }
-  | { status: "error"; error: unknown };
+  | { status: "error"; error: unknown }
+  | { status: "out-of-memory"; maxOldGenerationSizeMb: number };
 
 export type Task<T> = (signal: AbortSignal) => T | Promise<T>;
 
