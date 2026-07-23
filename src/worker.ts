@@ -1,5 +1,6 @@
 import { Worker } from "node:worker_threads";
 import type { Assertion, RunResult } from "./contract.js";
+import { checkOutputSize, validateResourceLimits } from "./limits.js";
 
 /**
  * Intrinsics whose prototypes a sandbox escape could otherwise repave to attack
@@ -54,6 +55,8 @@ export interface WorkerRunOptions<T> {
   grant?: Readonly<Record<string, unknown>>;
   /** Hard cap on the isolate's V8 old-space. Exceeding it kills the worker. */
   maxOldGenerationSizeMb?: number;
+  /** Refuse values whose measured UTF-8 payload exceeds this many bytes. */
+  maxOutputBytes?: number;
   signal?: AbortSignal;
   filename?: string;
 }
@@ -110,10 +113,12 @@ const vm = require('node:vm');
  * This is the stronger sibling of the in-process {@link run}. It closes the
  * pinned in-process gap where `this.constructor.constructor` reaches the host
  * realm: here an escape from the `vm` context reaches only the WORKER's realm,
- * whose `process.env` is empty and whose globals are frozen. The thread is
- * hard-killed on the deadline, so a synchronous spin AND an async task that
- * never settles are both preempted, not merely abandoned. A caller-supplied
- * `maxOldGenerationSizeMb` caps the heap and reports `out-of-memory` when hit.
+ * whose `process.env` is empty and whose globals are frozen.
+ *
+ * Resource ceilings: wall-clock deadline hard-kills the thread via
+ * `worker.terminate()` (deadline and caller abort both terminate), V8
+ * `maxOldGenerationSizeMb` reports `out-of-memory`, and `maxOutputBytes`
+ * refuses oversized returns before the post-condition runs.
  *
  * The tradeoff for real thread isolation: the `grant` and the returned value
  * cross by structured clone, so live function capabilities can't be handed in
@@ -123,11 +128,20 @@ export function runInWorker<T>(
   code: string,
   opts: WorkerRunOptions<T>,
 ): Promise<RunResult<T>> {
-  const { timeoutMs, assert, grant, maxOldGenerationSizeMb, signal, filename } =
-    opts;
-  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-    throw new RangeError("timeoutMs must be a positive, finite number");
-  }
+  const {
+    timeoutMs,
+    assert,
+    grant,
+    maxOldGenerationSizeMb,
+    maxOutputBytes,
+    signal,
+    filename,
+  } = opts;
+  validateResourceLimits({
+    timeoutMs,
+    ...(maxOldGenerationSizeMb !== undefined ? { maxOldGenerationSizeMb } : {}),
+    ...(maxOutputBytes !== undefined ? { maxOutputBytes } : {}),
+  });
 
   let worker: Worker;
   try {
@@ -153,6 +167,9 @@ export function runInWorker<T>(
 
   return new Promise<RunResult<T>>((resolve) => {
     let settled = false;
+    // terminate() is fire-and-forget: the OS reclaims the thread even if the
+    // promise races with a late message. finish is the single exit path so
+    // deadline, abort, OOM, and normal completion all hard-kill the isolate.
     const finish = (result: RunResult<T>) => {
       if (settled) return;
       settled = true;
@@ -179,11 +196,26 @@ export function runInWorker<T>(
       if (msg.ok) {
         clearTimeout(timer);
         const value = msg.value as T;
+        if (maxOutputBytes !== undefined) {
+          const size = checkOutputSize(value, maxOutputBytes);
+          if (size.exceeded) {
+            finish({
+              status: "output-too-large",
+              maxOutputBytes,
+              actualBytes: size.bytes,
+            });
+            return;
+          }
+        }
         void Promise.resolve(assert(value)).then(
           (passed) =>
             finish(
               passed
-                ? { status: "ok", value, durationMs: performance.now() - started }
+                ? {
+                    status: "ok",
+                    value,
+                    durationMs: performance.now() - started,
+                  }
                 : { status: "assertion-failed", value },
             ),
           (error) => finish({ status: "error", error }),

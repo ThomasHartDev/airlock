@@ -34,6 +34,7 @@ export interface SandboxRunOptions<T> {
   grant?: Readonly<Record<string, unknown>>;
   signal?: AbortSignal;
   filename?: string;
+  maxOutputBytes?: number;
 }
 
 export class ZeroCredentialViolation extends Error {
@@ -92,10 +93,7 @@ export async function run<T>(
   code: string,
   opts: SandboxRunOptions<T>,
 ): Promise<RunResult<T>> {
-  const { timeoutMs, assert, grant, signal, filename } = opts;
-  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-    throw new RangeError("timeoutMs must be a positive, finite number");
-  }
+  const { timeoutMs, assert, grant, signal, filename, maxOutputBytes } = opts;
 
   const context = vm.createContext({ ...(grant ?? {}) });
   const leaked = probeAmbientAuthority(context, Object.keys(grant ?? {}));
@@ -114,7 +112,12 @@ export async function run<T>(
         timeout: timeoutMs,
         breakOnSigint: true,
       }) as T | Promise<T>,
-    { timeoutMs, assert, ...(signal ? { signal } : {}) },
+    {
+      timeoutMs,
+      assert,
+      ...(signal ? { signal } : {}),
+      ...(maxOutputBytes !== undefined ? { maxOutputBytes } : {}),
+    },
   );
 
   if (result.status === "error" && isSyncTimeout(result.error)) {

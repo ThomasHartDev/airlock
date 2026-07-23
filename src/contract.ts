@@ -3,7 +3,8 @@ export type RunStatus =
   | "timeout"
   | "assertion-failed"
   | "error"
-  | "out-of-memory";
+  | "out-of-memory"
+  | "output-too-large";
 
 /**
  * A run only counts as verified when it carries `status: "ok"`. Every other
@@ -15,7 +16,8 @@ export type RunResult<T> =
   | { status: "timeout"; timeoutMs: number }
   | { status: "assertion-failed"; value: T }
   | { status: "error"; error: unknown }
-  | { status: "out-of-memory"; maxOldGenerationSizeMb: number };
+  | { status: "out-of-memory"; maxOldGenerationSizeMb: number }
+  | { status: "output-too-large"; maxOutputBytes: number; actualBytes: number };
 
 export type Task<T> = (signal: AbortSignal) => T | Promise<T>;
 
@@ -27,6 +29,8 @@ export interface VerifiedRunOptions<T> {
   assert: Assertion<T>;
   /** Caller-owned cancellation, merged with the internal deadline. */
   signal?: AbortSignal;
+  /** Refuse values whose measured UTF-8 payload exceeds this many bytes. */
+  maxOutputBytes?: number;
 }
 
 export function isVerified<T>(
