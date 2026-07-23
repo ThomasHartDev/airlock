@@ -9,6 +9,12 @@ export {
 export type { SandboxRunOptions } from "./sandbox.js";
 export { runInWorker, freezeRealm, FROZEN_INTRINSICS } from "./worker.js";
 export type { WorkerRunOptions } from "./worker.js";
+export {
+  validateResourceLimits,
+  measureOutputBytes,
+  checkOutputSize,
+} from "./limits.js";
+export type { ResourceLimits, OutputSizeCheck } from "./limits.js";
 export type {
   Assertion,
   RunResult,
