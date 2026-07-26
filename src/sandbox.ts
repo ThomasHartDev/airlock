@@ -1,5 +1,6 @@
 import * as vm from "node:vm";
 import type { Assertion, RunResult } from "./contract.js";
+import { buildSandboxRequire } from "./modules.js";
 import { runVerified } from "./run.js";
 
 /**
@@ -32,6 +33,11 @@ export interface SandboxRunOptions<T> {
   assert: Assertion<T>;
   /** Capabilities the caller chooses to hand in. This is the only authority the code gets. */
   grant?: Readonly<Record<string, unknown>>;
+  /**
+   * Builtin/package ids the sandbox may load via `require`. Omitted means no
+   * `require` at all; `[]` injects a require that denies every specifier.
+   */
+  allowedModules?: readonly string[];
   signal?: AbortSignal;
   filename?: string;
   maxOutputBytes?: number;
@@ -93,10 +99,25 @@ export async function run<T>(
   code: string,
   opts: SandboxRunOptions<T>,
 ): Promise<RunResult<T>> {
-  const { timeoutMs, assert, grant, signal, filename, maxOutputBytes } = opts;
+  const {
+    timeoutMs,
+    assert,
+    grant,
+    allowedModules,
+    signal,
+    filename,
+    maxOutputBytes,
+  } = opts;
 
-  const context = vm.createContext({ ...(grant ?? {}) });
-  const leaked = probeAmbientAuthority(context, Object.keys(grant ?? {}));
+  // allowedModules always wins over a grant-supplied require so a caller cannot
+  // accidentally re-open full host require while intending an allowlist.
+  const bindings: Record<string, unknown> = { ...(grant ?? {}) };
+  if (allowedModules !== undefined) {
+    bindings.require = buildSandboxRequire(allowedModules);
+  }
+
+  const context = vm.createContext(bindings);
+  const leaked = probeAmbientAuthority(context, Object.keys(bindings));
   if (leaked.length > 0) throw new ZeroCredentialViolation(leaked);
 
   let script: vm.Script;

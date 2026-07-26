@@ -10,6 +10,14 @@ export type { SandboxRunOptions } from "./sandbox.js";
 export { runInWorker, freezeRealm, FROZEN_INTRINSICS } from "./worker.js";
 export type { WorkerRunOptions } from "./worker.js";
 export {
+  ModuleNotAllowedError,
+  expandAllowlist,
+  isPathSpecifier,
+  isModuleAllowed,
+  createGatedRequire,
+  buildSandboxRequire,
+} from "./modules.js";
+export {
   validateResourceLimits,
   measureOutputBytes,
   checkOutputSize,

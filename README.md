@@ -6,7 +6,7 @@ Ephemeral, zero-credential, self-verifying execution for untrusted or agent-writ
 
 An airlock is the safe way to run code you do not trust: an LLM-generated snippet, a plugin, a user-submitted function. This repo builds that primitive from the ground up in TypeScript. The guarantee is that a caller never reads an output unless the run stayed inside its resource ceilings and its output satisfies a post-condition the caller supplied. Untrusted code is guilty until proven correct, and the type system makes you prove it before you can touch the value.
 
-The first slice was the contract and the in-process runner that enforces it. The second slice added `run(code, opts)`, which executes untrusted source in a fresh `node:vm` context with no ambient authority. The third slice added `runInWorker(code, opts)`: the same contract on a `worker_threads` isolate with frozen globals and an empty env. This slice hardens the **resource limit** layer: wall-clock deadline with hard terminate on abort, V8 heap cap, and output size caps, so a runaway cannot wedge the host on time, memory, or a multi-megabyte return value. Later slices add a Docker-backed tier and a growing suite of documented escape-attempt tests.
+The first slice was the contract and the in-process runner that enforces it. The second slice added `run(code, opts)`, which executes untrusted source in a fresh `node:vm` context with no ambient authority. The third slice added `runInWorker(code, opts)`: the same contract on a `worker_threads` isolate with frozen globals and an empty env. The fourth slice hardens the **resource limit** layer: wall-clock deadline with hard terminate on abort, V8 heap cap, and output size caps. This slice adds a **deny-by-default module loader**: untrusted code has no `require` unless the caller opts in with `allowedModules`, and only the listed builtin or package ids resolve. Relative and absolute paths are always refused. Later slices add a Docker-backed tier and a growing suite of documented escape-attempt tests.
 
 ## Concepts demonstrated
 
@@ -23,6 +23,9 @@ The first slice was the contract and the in-process runner that enforces it. The
 - **Thread-level isolation with `worker_threads`.** `runInWorker` runs untrusted source in a dedicated V8 isolate on its own thread. The in-process constructor-walk escape reaches only the worker's realm, which is started with an empty `process.env` and cannot see the host's environment. An escape-attempt test walks the same constructor chain and confirms a host secret placed in `process.env` stays out of reach.
 - **Frozen realm hardening.** Before any untrusted code runs, the worker freezes `globalThis` and the core intrinsics and their prototypes, so an escape into the worker realm cannot repave shared state that later runs in the same isolate would rely on.
 - **Layered preemption.** A synchronous spin is killed by V8's `timeout`; an async task that never settles is aborted by the deadline race (and terminated on the worker tier). `run` composes both so neither class of runaway can wedge the caller.
+- **Deny-by-default module loading.** `require` is unbound unless the caller sets `allowedModules`. An empty list injects a gate that refuses every specifier; a non-empty list is an exact-match allowlist (with bare/`node:` equivalence), never a prefix grant.
+- **Capability allowlists.** Module loading is treated as ambient authority: the host's real `require` is reachable only after the gate admits the id, so unlisted builtins like `fs` stay closed even when a sibling id is granted.
+- **Path-specifier refusal.** Relative and absolute paths are dropped from the allowlist and rejected at load time so filesystem resolution cannot re-open host I/O through a crafty entry.
 - **Strict TypeScript.** `strict`, `noUncheckedIndexedAccess`, and `exactOptionalPropertyTypes`, no `any`.
 
 ## The primitive contract
@@ -123,6 +126,29 @@ await runInWorker("'x'.repeat(1_000_000)", {
 // -> { status: "output-too-large", maxOutputBytes: 1024, actualBytes: ... }
 ```
 
+Module loading is off by default. Pass `allowedModules` to inject a gated `require` on either tier. Only exact builtin or package ids resolve; paths never do.
+
+```ts
+import { run, isVerified } from "airlock";
+
+// allowed: path (bare or node:path). denied: fs, relative paths, everything else.
+const result = await run<string>("require('node:path').join('a', 'b')", {
+  timeoutMs: 100,
+  assert: (p) => typeof p === "string",
+  allowedModules: ["path"],
+});
+
+if (isVerified(result)) console.log(result.value);
+
+// empty allowlist still injects require, but every load throws ModuleNotAllowedError
+await run("require('path')", {
+  timeoutMs: 100,
+  assert: () => true,
+  allowedModules: [],
+});
+// -> { status: "error", error: ModuleNotAllowedError }
+```
+
 ## Develop
 
 ```bash
@@ -138,3 +164,4 @@ pnpm run build
 - `src/sandbox.ts`: `run(code, opts)` executes untrusted source in a zero-credential `node:vm` context (no `process`/`require`/`fetch`/timers), grants only what the caller passes, preempts synchronous spins via V8's timeout, and fails closed with a probed `ZeroCredentialViolation` if ambient authority leaks in. Includes documented escape-attempt tests.
 - `src/worker.ts`: `runInWorker(code, opts)` runs untrusted source in a `worker_threads` isolate started with an empty `process.env` and frozen globals, caps the heap with `maxOldGenerationSizeMb` (reported as `out-of-memory`), and hard-kills the thread on the deadline so a sync spin and a never-settling async task are both preempted. An escape-attempt test confirms the constructor walk that reaches the host realm in-process reaches only the credential-free worker realm here.
 - `src/limits.ts`: shared resource ceilings for every tier. Wall-clock timeout aborts the task signal and, on the worker tier, calls `worker.terminate()` on both deadline and caller abort. Heap cap via V8 `resourceLimits`. Output size caps (`maxOutputBytes`) measure UTF-8 payload with a budgeted walk (cycle-safe, early-exit) and refuse with `output-too-large` before the post-condition runs.
+- `src/modules.ts`: deny-by-default module loader with an explicit `allowedModules` allowlist. Omitted means no `require`; `[]` or a list injects `createGatedRequire` over the host/worker require. Exact match only (bare and `node:` equivalent), path specifiers always refused, and the gate wins over a grant-supplied `require`. Wired into both `run` and `runInWorker`.
