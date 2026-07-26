@@ -1,6 +1,7 @@
 import { Worker } from "node:worker_threads";
 import type { Assertion, RunResult } from "./contract.js";
 import { checkOutputSize, validateResourceLimits } from "./limits.js";
+import { createGatedRequire } from "./modules.js";
 
 /**
  * Intrinsics whose prototypes a sandbox escape could otherwise repave to attack
@@ -53,6 +54,11 @@ export interface WorkerRunOptions<T> {
   assert: Assertion<T>;
   /** Structured-cloneable capabilities only; live functions can't cross the thread boundary. */
   grant?: Readonly<Record<string, unknown>>;
+  /**
+   * Builtin/package ids the isolate may load via `require`. Omitted means no
+   * `require`; `[]` injects a require that denies every specifier.
+   */
+  allowedModules?: readonly string[];
   /** Hard cap on the isolate's V8 old-space. Exceeding it kills the worker. */
   maxOldGenerationSizeMb?: number;
   /** Refuse values whose measured UTF-8 payload exceeds this many bytes. */
@@ -76,18 +82,28 @@ const OOM_CODE = "ERR_WORKER_OUT_OF_MEMORY";
 
 // The worker body is a string so a single build artifact ships without a
 // separate worker entry file, and so tests exercise the same code as dist.
-// freezeRealm is injected by source and applied to the worker's own globals.
+// freezeRealm + createGatedRequire are injected by source and applied inside.
 const BOOTSTRAP = `
 'use strict';
 const { workerData, parentPort } = require('node:worker_threads');
 const vm = require('node:vm');
+const { createRequire } = require('node:module');
+const path = require('node:path');
 
 (${freezeRealm.toString()})(globalThis, ${JSON.stringify(FROZEN_INTRINSICS)});
+const createGatedRequire = ${createGatedRequire.toString()};
 
 (async () => {
   try {
-    const { code, grant, timeoutMs, filename } = workerData;
-    const context = vm.createContext({ ...(grant || {}) });
+    const { code, grant, timeoutMs, filename, allowedModules } = workerData;
+    const bindings = { ...(grant || {}) };
+    // eval workers have no real __filename; anchor createRequire on cwd so
+    // builtins resolve and relative paths still hit the path-specifier deny.
+    if (Array.isArray(allowedModules)) {
+      const hostRequire = createRequire(path.join(process.cwd(), 'airlock-worker.js'));
+      bindings.require = createGatedRequire(allowedModules, hostRequire);
+    }
+    const context = vm.createContext(bindings);
     const script = new vm.Script(code, { filename });
     const value = await script.runInContext(context, { timeout: timeoutMs });
     parentPort.postMessage({ ok: true, value });
@@ -132,6 +148,7 @@ export function runInWorker<T>(
     timeoutMs,
     assert,
     grant,
+    allowedModules,
     maxOldGenerationSizeMb,
     maxOutputBytes,
     signal,
@@ -153,6 +170,8 @@ export function runInWorker<T>(
         grant: grant ?? {},
         timeoutMs,
         filename: filename ?? "airlock-worker.js",
+        allowedModules:
+          allowedModules === undefined ? undefined : [...allowedModules],
       },
       ...(maxOldGenerationSizeMb !== undefined
         ? { resourceLimits: { maxOldGenerationSizeMb } }
