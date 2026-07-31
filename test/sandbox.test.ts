@@ -25,7 +25,7 @@ describe("run", () => {
       assert: (v) => v === 42,
     });
 
-    expect(result).toEqual({ status: "assertion-failed", value: 41 });
+    expect(result).toEqual({ status: "assertion-failed", verified: false, value: 41 });
     expect(isVerified(result)).toBe(false);
   });
 
@@ -65,7 +65,7 @@ describe("run", () => {
       assert: () => true,
     });
 
-    expect(result).toEqual({ status: "timeout", timeoutMs: 25 });
+    expect(result).toEqual({ status: "timeout", verified: false, timeoutMs: 25 });
   });
 
   it("times out on an async task that never settles", async () => {
@@ -74,7 +74,7 @@ describe("run", () => {
       assert: () => true,
     });
 
-    expect(result).toEqual({ status: "timeout", timeoutMs: 25 });
+    expect(result).toEqual({ status: "timeout", verified: false, timeoutMs: 25 });
   });
 
   it.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY])(
