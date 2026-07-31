@@ -193,7 +193,7 @@ describe("wall-clock timeout terminates the worker on abort", () => {
     });
     const elapsed = performance.now() - started;
 
-    expect(result).toEqual({ status: "timeout", timeoutMs: 80 });
+    expect(result).toEqual({ status: "timeout", verified: false, timeoutMs: 80 });
     // terminate() should reclaim the thread promptly after the timer fires
     expect(elapsed).toBeLessThan(1500);
   });

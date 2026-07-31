@@ -2,6 +2,7 @@ import { Worker } from "node:worker_threads";
 import type { Assertion, RunResult } from "./contract.js";
 import { checkOutputSize, validateResourceLimits } from "./limits.js";
 import { createGatedRequire } from "./modules.js";
+import { selfVerify } from "./verify.js";
 
 /**
  * Intrinsics whose prototypes a sandbox escape could otherwise repave to attack
@@ -179,7 +180,7 @@ export function runInWorker<T>(
     });
   } catch (error) {
     // A non-cloneable grant (e.g. a function) fails at construction.
-    return Promise.resolve({ status: "error", error });
+    return Promise.resolve({ status: "error", verified: false, error });
   }
 
   const started = performance.now();
@@ -199,11 +200,11 @@ export function runInWorker<T>(
     };
 
     const timer = setTimeout(() => {
-      finish({ status: "timeout", timeoutMs });
+      finish({ status: "timeout", verified: false, timeoutMs });
     }, timeoutMs);
 
     const onAbort = () => {
-      finish({ status: "error", error: signal?.reason });
+      finish({ status: "error", verified: false, error: signal?.reason });
     };
     if (signal) {
       if (signal.aborted) return onAbort();
@@ -220,49 +221,72 @@ export function runInWorker<T>(
           if (size.exceeded) {
             finish({
               status: "output-too-large",
+              verified: false,
               maxOutputBytes,
               actualBytes: size.bytes,
             });
             return;
           }
         }
-        void Promise.resolve(assert(value)).then(
-          (passed) =>
+        void selfVerify(value, assert).then(
+          (check) => {
+            if (check.verified) {
+              finish({
+                status: "ok",
+                verified: true,
+                value: check.value,
+                durationMs: performance.now() - started,
+              });
+              return;
+            }
             finish(
-              passed
+              check.reason !== undefined
                 ? {
-                    status: "ok",
-                    value,
-                    durationMs: performance.now() - started,
+                    status: "assertion-failed",
+                    verified: false,
+                    value: check.value,
+                    reason: check.reason,
                   }
-                : { status: "assertion-failed", value },
-            ),
-          (error) => finish({ status: "error", error }),
+                : {
+                    status: "assertion-failed",
+                    verified: false,
+                    value: check.value,
+                  },
+            );
+          },
+          (error: unknown) =>
+            finish({ status: "error", verified: false, error }),
         );
         return;
       }
       if (msg.error.code === SYNC_TIMEOUT_CODE) {
-        finish({ status: "timeout", timeoutMs });
+        finish({ status: "timeout", verified: false, timeoutMs });
         return;
       }
-      finish({ status: "error", error: reviveError(msg.error) });
+      finish({
+        status: "error",
+        verified: false,
+        error: reviveError(msg.error),
+      });
     });
 
     worker.on("error", (error: Error & { code?: string }) => {
       if (error.code === OOM_CODE) {
         finish({
           status: "out-of-memory",
+          verified: false,
           maxOldGenerationSizeMb: maxOldGenerationSizeMb ?? 0,
         });
         return;
       }
-      finish({ status: "error", error });
+      finish({ status: "error", verified: false, error });
     });
 
     worker.on("exit", (code) => {
       if (code !== 0) {
         finish({
           status: "error",
+          verified: false,
           error: new Error(`worker exited with code ${code}`),
         });
       }

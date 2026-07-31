@@ -124,7 +124,7 @@ export async function run<T>(
   try {
     script = new vm.Script(code, { filename: filename ?? "airlock-sandbox.js" });
   } catch (error) {
-    return { status: "error", error };
+    return { status: "error", verified: false, error };
   }
 
   const result = await runVerified<T>(
@@ -142,7 +142,7 @@ export async function run<T>(
   );
 
   if (result.status === "error" && isSyncTimeout(result.error)) {
-    return { status: "timeout", timeoutMs };
+    return { status: "timeout", verified: false, timeoutMs };
   }
   return result;
 }

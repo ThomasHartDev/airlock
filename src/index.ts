@@ -1,6 +1,17 @@
 export { runVerified } from "./run.js";
 export { isVerified } from "./contract.js";
 export {
+  selfVerify,
+  normalizeAssertOutcome,
+  allAssertions,
+  anyAssertion,
+} from "./verify.js";
+export type {
+  AssertOutcome,
+  AssertionFn,
+  VerifyResult,
+} from "./verify.js";
+export {
   run,
   probeAmbientAuthority,
   ZeroCredentialViolation,

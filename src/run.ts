@@ -1,11 +1,13 @@
 import type { RunResult, Task, VerifiedRunOptions } from "./contract.js";
 import { checkOutputSize, validateResourceLimits } from "./limits.js";
+import { selfVerify } from "./verify.js";
 
 const DEADLINE = Symbol("deadline");
 
 /**
- * The core airlock primitive. Runs `task` under a deadline, then checks the
- * supplied post-condition, and hands back the value only when both pass.
+ * The core airlock primitive. Runs `task` under a deadline, then self-verifies
+ * the produced value with the supplied post-condition, and hands back
+ * `verified: true` only when both the deadline and the assertion pass.
  *
  * The deadline is enforced by racing an internal timer and aborting the signal
  * the task receives. That stops async and cooperative work, but a task that
@@ -47,7 +49,7 @@ export async function runVerified<T>(
   try {
     const outcome = await Promise.race([running, deadline]);
     if (outcome === DEADLINE) {
-      return { status: "timeout", timeoutMs };
+      return { status: "timeout", verified: false, timeoutMs };
     }
 
     const value = outcome as T;
@@ -56,18 +58,32 @@ export async function runVerified<T>(
       if (size.exceeded) {
         return {
           status: "output-too-large",
+          verified: false,
           maxOutputBytes,
           actualBytes: size.bytes,
         };
       }
     }
 
-    const passed = await assert(value);
-    return passed
-      ? { status: "ok", value, durationMs: performance.now() - started }
-      : { status: "assertion-failed", value };
+    const check = await selfVerify(value, assert);
+    if (check.verified) {
+      return {
+        status: "ok",
+        verified: true,
+        value: check.value,
+        durationMs: performance.now() - started,
+      };
+    }
+    return check.reason !== undefined
+      ? {
+          status: "assertion-failed",
+          verified: false,
+          value: check.value,
+          reason: check.reason,
+        }
+      : { status: "assertion-failed", verified: false, value: check.value };
   } catch (error) {
-    return { status: "error", error };
+    return { status: "error", verified: false, error };
   } finally {
     if (timer !== undefined) clearTimeout(timer);
     signal?.removeEventListener("abort", relayAbort);

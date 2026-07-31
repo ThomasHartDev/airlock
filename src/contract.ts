@@ -1,3 +1,5 @@
+import type { AssertionFn } from "./verify.js";
+
 export type RunStatus =
   | "ok"
   | "timeout"
@@ -7,22 +9,38 @@ export type RunStatus =
   | "output-too-large";
 
 /**
- * A run only counts as verified when it carries `status: "ok"`. Every other
- * variant is a refusal, so a caller cannot read `value` without first proving
- * the run passed both the deadline and the post-condition.
+ * A run only counts as verified when it carries `verified: true`. Every other
+ * variant is a refusal, so a caller cannot treat a value as trusted without
+ * first proving the run passed both the deadline and the post-condition.
+ * The literal `true` / `false` on each arm makes the trust boundary visible
+ * at the type level, not only as a status string.
  */
 export type RunResult<T> =
-  | { status: "ok"; value: T; durationMs: number }
-  | { status: "timeout"; timeoutMs: number }
-  | { status: "assertion-failed"; value: T }
-  | { status: "error"; error: unknown }
-  | { status: "out-of-memory"; maxOldGenerationSizeMb: number }
-  | { status: "output-too-large"; maxOutputBytes: number; actualBytes: number };
+  | { status: "ok"; verified: true; value: T; durationMs: number }
+  | { status: "timeout"; verified: false; timeoutMs: number }
+  | {
+      status: "assertion-failed";
+      verified: false;
+      value: T;
+      reason?: string;
+    }
+  | { status: "error"; verified: false; error: unknown }
+  | {
+      status: "out-of-memory";
+      verified: false;
+      maxOldGenerationSizeMb: number;
+    }
+  | {
+      status: "output-too-large";
+      verified: false;
+      maxOutputBytes: number;
+      actualBytes: number;
+    };
 
 export type Task<T> = (signal: AbortSignal) => T | Promise<T>;
 
-/** Post-condition. A run's output is trusted only if this returns true. */
-export type Assertion<T> = (value: T) => boolean | Promise<boolean>;
+/** Post-condition. A run's output is trusted only if this returns a pass. */
+export type Assertion<T> = AssertionFn<T>;
 
 export interface VerifiedRunOptions<T> {
   timeoutMs: number;
@@ -35,6 +53,6 @@ export interface VerifiedRunOptions<T> {
 
 export function isVerified<T>(
   result: RunResult<T>,
-): result is Extract<RunResult<T>, { status: "ok" }> {
-  return result.status === "ok";
+): result is Extract<RunResult<T>, { verified: true }> {
+  return result.verified === true;
 }
