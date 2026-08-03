@@ -6,7 +6,7 @@ Ephemeral, zero-credential, self-verifying execution for untrusted or agent-writ
 
 An airlock is the safe way to run code you do not trust: an LLM-generated snippet, a plugin, a user-submitted function. This repo builds that primitive from the ground up in TypeScript. The guarantee is that a caller never reads an output unless the run stayed inside its resource ceilings and its output satisfies a post-condition the caller supplied. Untrusted code is guilty until proven correct, and the type system makes you prove it before you can touch the value.
 
-The first slices covered the verification contract, zero-credential `node:vm` execution, `worker_threads` isolation, resource ceilings, and a deny-by-default module allowlist. This slice adds **ephemeral filesystem isolation**: every opted-in run gets a private tmpdir injected as `workdir`, optional host fixtures copied in as read-only mounts, and a guaranteed wipe when the run ends (success, error, timeout, or throw). Later slices add a Docker-backed tier and a growing suite of documented escape-attempt tests.
+The first slices covered the verification contract, zero-credential `node:vm` execution, `worker_threads` isolation, resource ceilings, and a deny-by-default module allowlist. This slice adds **ephemeral filesystem isolation**: every opted-in run gets a private tmpdir injected as `workdir`, optional host fixtures **snapshotted** in as read-only copies (symlink trees refused), and a guaranteed wipe when the run ends (success, error, timeout, or throw). Later slices add a Docker-backed tier and a growing suite of documented escape-attempt tests.
 
 ## Concepts demonstrated
 
@@ -27,8 +27,8 @@ The first slices covered the verification contract, zero-credential `node:vm` ex
 - **Capability allowlists.** Module loading is treated as ambient authority: the host's real `require` is reachable only after the gate admits the id, so unlisted builtins like `fs` stay closed even when a sibling id is granted.
 - **Path-specifier refusal.** Relative and absolute paths are dropped from the allowlist and rejected at load time so filesystem resolution cannot re-open host I/O through a crafty entry.
 - **Ephemeral workspaces.** Per-run private directories via `mkdtemp`, injected as `workdir`, wiped on every exit path (try/finally / RAII-style lifecycle).
-- **Read-only fixture mounts.** Host files and trees copied under relative keys, then locked read-only (mode bits plus Linux immutable flag when available).
-- **Path-escape rejection.** Fixture keys reject `..`, absolute paths, and drive forms before join.
+- **Read-only fixture snapshots.** Host files and trees are **copied** under relative keys (not live mounts), then locked read-only (mode bits plus Linux immutable flag when available). Symlink-bearing host paths and trees are **rejected** (`FixturePathError`) so a link cannot re-open a host file under `workdir`.
+- **Path-escape rejection.** Fixture keys reject `..`, absolute paths, drive forms, and keys that normalize onto `.` (workspace root) before join.
 - **Cross-run isolation.** Concurrent runs get distinct tmpdirs; writes under one `workdir` never appear under another.
 - **Strict TypeScript.** `strict`, `noUncheckedIndexedAccess`, and `exactOptionalPropertyTypes`, no `any`.
 
@@ -153,7 +153,9 @@ await run("require('path')", {
 // -> { status: "error", error: ModuleNotAllowedError }
 ```
 
-Filesystem access is off the host by default. Opt in with `ephemeralFs` for a private tmpdir (injected as `workdir`) that is always wiped when the run finishes. Optional fixtures are copied from host paths into the workspace as read-only files:
+Filesystem access is off the host by default. Opt in with `ephemeralFs` for a private tmpdir (injected as `workdir`) that is always wiped when the run finishes. Optional fixtures are **content snapshots**: regular files and symlink-free trees are copied into the workspace, then made read-only. Host originals are not re-opened under `workdir`. A host path that is a symlink, or a directory tree that contains any symlink, is refused with `FixturePathError` (default `fs.cp` would preserve links and let guest writes mutate the host).
+
+Read-only is advisory for same-uid guests without the immutable bit: mode bits alone can be `chmod`'d away. On Linux, airlock best-effort sets `chattr +i` when the filesystem allows it; elsewhere (and when `chattr` is unavailable) RO is mode bits only, not a privilege jail.
 
 ```ts
 import { runInWorker, isVerified, withEphemeralWorkspace } from "airlock";
@@ -171,7 +173,7 @@ if (isVerified(result)) console.log(result.value);
 
 // standalone lifecycle outside a sandbox run; wiped when the callback settles
 await withEphemeralWorkspace({ fixtures: { "in.json": "/host/fixture.json" } }, async (ws) => {
-  // ws.root is writable; mounted fixtures under it are read-only
+  // ws.root is writable; snapshotted fixtures under it are read-only
 });
 ```
 
@@ -191,4 +193,4 @@ pnpm run build
 - `src/worker.ts`: `runInWorker(code, opts)` runs untrusted source in a `worker_threads` isolate started with an empty `process.env` and frozen globals, caps the heap with `maxOldGenerationSizeMb` (reported as `out-of-memory`), and hard-kills the thread on the deadline so a sync spin and a never-settling async task are both preempted. An escape-attempt test confirms the constructor walk that reaches the host realm in-process reaches only the credential-free worker realm here.
 - `src/limits.ts`: shared resource ceilings for every tier. Wall-clock timeout aborts the task signal and, on the worker tier, calls `worker.terminate()` on both deadline and caller abort. Heap cap via V8 `resourceLimits`. Output size caps (`maxOutputBytes`) measure UTF-8 payload with a budgeted walk (cycle-safe, early-exit) and refuse with `output-too-large` before the post-condition runs.
 - `src/modules.ts`: deny-by-default module loader with an explicit `allowedModules` allowlist. Omitted means no `require`; `[]` or a list injects `createGatedRequire` over the host/worker require. Exact match only (bare and `node:` equivalent), path specifiers always refused, and the gate wins over a grant-supplied `require`. Wired into both `run` and `runInWorker`.
-- `src/ephemeral-fs.ts`: per-run tmpdir wiped on exit, optional read-only fixture mount. `createEphemeralWorkspace` / `withEphemeralWorkspace` for standalone use; `ephemeralFs` on `run` and `runInWorker` injects `workdir` and always disposes after the result settles (including error and timeout paths). Fixture keys cannot escape the root; host originals stay untouched.
+- `src/ephemeral-fs.ts`: per-run tmpdir wiped on exit, optional read-only fixture **snapshots** (content copy, not live mount). `createEphemeralWorkspace` / `withEphemeralWorkspace` for standalone use; `ephemeralFs` on `run` and `runInWorker` injects `workdir` and always disposes after the result settles (including error and timeout paths). Fixture keys cannot escape the root. Symlink host paths and symlink-bearing trees are rejected so host files cannot re-open under `workdir`.
