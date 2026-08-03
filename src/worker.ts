@@ -1,5 +1,9 @@
 import { Worker } from "node:worker_threads";
 import type { Assertion, RunResult } from "./contract.js";
+import {
+  createEphemeralWorkspace,
+  type EphemeralFsOptions,
+} from "./ephemeral-fs.js";
 import { checkOutputSize, validateResourceLimits } from "./limits.js";
 import { createGatedRequire } from "./modules.js";
 
@@ -63,6 +67,8 @@ export interface WorkerRunOptions<T> {
   maxOldGenerationSizeMb?: number;
   /** Refuse values whose measured UTF-8 payload exceeds this many bytes. */
   maxOutputBytes?: number;
+  /** Per-run private dir as `workdir`, wiped on exit. `true` = empty workspace. */
+  ephemeralFs?: true | EphemeralFsOptions;
   signal?: AbortSignal;
   filename?: string;
 }
@@ -144,6 +150,23 @@ export function runInWorker<T>(
   code: string,
   opts: WorkerRunOptions<T>,
 ): Promise<RunResult<T>> {
+  // Validate before any await so bad limits still throw synchronously.
+  validateResourceLimits({
+    timeoutMs: opts.timeoutMs,
+    ...(opts.maxOldGenerationSizeMb !== undefined
+      ? { maxOldGenerationSizeMb: opts.maxOldGenerationSizeMb }
+      : {}),
+    ...(opts.maxOutputBytes !== undefined
+      ? { maxOutputBytes: opts.maxOutputBytes }
+      : {}),
+  });
+  return runInWorkerWithFs(code, opts);
+}
+
+async function runInWorkerWithFs<T>(
+  code: string,
+  opts: WorkerRunOptions<T>,
+): Promise<RunResult<T>> {
   const {
     timeoutMs,
     assert,
@@ -151,14 +174,18 @@ export function runInWorker<T>(
     allowedModules,
     maxOldGenerationSizeMb,
     maxOutputBytes,
+    ephemeralFs,
     signal,
     filename,
   } = opts;
-  validateResourceLimits({
-    timeoutMs,
-    ...(maxOldGenerationSizeMb !== undefined ? { maxOldGenerationSizeMb } : {}),
-    ...(maxOutputBytes !== undefined ? { maxOutputBytes } : {}),
-  });
+
+  const workspace =
+    ephemeralFs === undefined
+      ? null
+      : await createEphemeralWorkspace(ephemeralFs === true ? {} : ephemeralFs);
+
+  const grantPayload: Record<string, unknown> = { ...(grant ?? {}) };
+  if (workspace) grantPayload.workdir = workspace.root;
 
   let worker: Worker;
   try {
@@ -167,7 +194,7 @@ export function runInWorker<T>(
       env: {},
       workerData: {
         code,
-        grant: grant ?? {},
+        grant: grantPayload,
         timeoutMs,
         filename: filename ?? "airlock-worker.js",
         allowedModules:
@@ -179,10 +206,12 @@ export function runInWorker<T>(
     });
   } catch (error) {
     // A non-cloneable grant (e.g. a function) fails at construction.
-    return Promise.resolve({ status: "error", error });
+    if (workspace) await workspace.dispose();
+    return { status: "error", error };
   }
 
   const started = performance.now();
+  const ws = workspace;
 
   return new Promise<RunResult<T>>((resolve) => {
     let settled = false;
@@ -195,7 +224,8 @@ export function runInWorker<T>(
       clearTimeout(timer);
       if (signal) signal.removeEventListener("abort", onAbort);
       void worker.terminate();
-      resolve(result);
+      const done = ws ? ws.dispose() : Promise.resolve();
+      void done.finally(() => resolve(result));
     };
 
     const timer = setTimeout(() => {
