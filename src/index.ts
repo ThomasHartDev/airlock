@@ -23,6 +23,16 @@ export {
   checkOutputSize,
 } from "./limits.js";
 export type { ResourceLimits, OutputSizeCheck } from "./limits.js";
+export {
+  createEphemeralWorkspace,
+  withEphemeralWorkspace,
+  assertSafeFixtureKey,
+  FixturePathError,
+} from "./ephemeral-fs.js";
+export type {
+  EphemeralFsOptions,
+  EphemeralWorkspace,
+} from "./ephemeral-fs.js";
 export type {
   Assertion,
   RunResult,
