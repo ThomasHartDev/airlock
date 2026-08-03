@@ -30,9 +30,12 @@ async function hostFile(name: string, body: string): Promise<string> {
 const RO_DENY = expect.stringMatching(/^(EACCES|EPERM)$/);
 
 describe("assertSafeFixtureKey", () => {
-  it.each(["", "../x", "..", "/abs", "C:\\win"])("rejects %s", (key) => {
-    expect(() => assertSafeFixtureKey(key)).toThrow(FixturePathError);
-  });
+  it.each(["", "../x", "..", "/abs", "C:\\win", "foo/..", "."])(
+    "rejects %s",
+    (key) => {
+      expect(() => assertSafeFixtureKey(key)).toThrow(FixturePathError);
+    },
+  );
   it("accepts nested relative keys", () => {
     expect(() => assertSafeFixtureKey("data/in.json")).not.toThrow();
   });
@@ -94,6 +97,31 @@ describe("createEphemeralWorkspace", () => {
       code: "ENOENT",
     });
     await Promise.all([a.dispose(), b.dispose()]);
+  });
+
+  it("refuses directory fixtures that contain host-pointing symlinks", async () => {
+    const secretDir = await fs.mkdtemp(path.join(os.tmpdir(), "airlock-host-"));
+    leftovers.push(secretDir);
+    const hostSecret = path.join(secretDir, "owned.txt");
+    await fs.writeFile(hostSecret, "HOST-ORIGINAL", "utf8");
+
+    const fixtureDir = await fs.mkdtemp(path.join(os.tmpdir(), "airlock-fix-"));
+    leftovers.push(fixtureDir);
+    await fs.symlink(hostSecret, path.join(fixtureDir, "link"));
+
+    await expect(
+      createEphemeralWorkspace({ fixtures: { pack: fixtureDir } }),
+    ).rejects.toBeInstanceOf(FixturePathError);
+
+    await expect(fs.readFile(hostSecret, "utf8")).resolves.toBe("HOST-ORIGINAL");
+
+    // Top-level host path that is itself a symlink is also refused.
+    const linkAsRoot = path.join(secretDir, "dir-link");
+    await fs.symlink(fixtureDir, linkAsRoot);
+    await expect(
+      createEphemeralWorkspace({ fixtures: { pack: linkAsRoot } }),
+    ).rejects.toBeInstanceOf(FixturePathError);
+    await expect(fs.readFile(hostSecret, "utf8")).resolves.toBe("HOST-ORIGINAL");
   });
 });
 
@@ -186,5 +214,27 @@ describe("run / runInWorker with ephemeralFs", () => {
       });
     }
     await expect(fs.readFile(seed, "utf8")).resolves.toBe("42");
+  });
+
+  it("rejects symlink fixture trees via runInWorker and leaves host untouched", async () => {
+    const secretDir = await fs.mkdtemp(path.join(os.tmpdir(), "airlock-host-"));
+    leftovers.push(secretDir);
+    const hostSecret = path.join(secretDir, "owned.txt");
+    await fs.writeFile(hostSecret, "HOST-ORIGINAL", "utf8");
+
+    const fixtureDir = await fs.mkdtemp(path.join(os.tmpdir(), "airlock-fix-"));
+    leftovers.push(fixtureDir);
+    await fs.symlink(hostSecret, path.join(fixtureDir, "link"));
+
+    await expect(
+      runInWorker("1", {
+        timeoutMs: 1000,
+        assert: () => true,
+        ephemeralFs: { fixtures: { pack: fixtureDir } },
+        allowedModules: ["fs", "path"],
+      }),
+    ).rejects.toBeInstanceOf(FixturePathError);
+
+    await expect(fs.readFile(hostSecret, "utf8")).resolves.toBe("HOST-ORIGINAL");
   });
 });

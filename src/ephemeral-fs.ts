@@ -40,6 +40,8 @@ export function assertSafeFixtureKey(key: string): void {
   }
   const normalized = path.posix.normalize(key.replace(/\\/g, "/"));
   if (
+    normalized === "." ||
+    normalized === "" ||
     normalized === ".." ||
     normalized.startsWith("../") ||
     normalized.includes("/../") ||
@@ -97,9 +99,18 @@ export async function withEphemeralWorkspace<T>(
 }
 
 async function mountReadOnly(hostPath: string, dest: string): Promise<void> {
-  const stat = await fs.stat(hostPath);
+  // WHY lstat: fs.cp keeps symlinks; a host-pointing link under workdir is a write escape.
+  const stat = await fs.lstat(hostPath);
+  if (stat.isSymbolicLink()) {
+    throw new FixturePathError(
+      hostPath,
+      "must not be a symbolic link (host paths must not re-open under workdir)",
+    );
+  }
   if (stat.isDirectory()) {
+    await assertNoSymlinksInTree(hostPath);
     await fs.cp(hostPath, dest, { recursive: true, errorOnExist: true });
+    await assertNoSymlinksInTree(dest);
     await makeTreeReadOnly(dest);
     return;
   }
@@ -111,9 +122,35 @@ async function mountReadOnly(hostPath: string, dest: string): Promise<void> {
   await lockReadOnly(dest);
 }
 
+async function assertNoSymlinksInTree(root: string): Promise<void> {
+  const stack = [root];
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    for (const name of await fs.readdir(current)) {
+      const full = path.join(current, name);
+      const st = await fs.lstat(full);
+      if (st.isSymbolicLink()) {
+        throw new FixturePathError(
+          full,
+          "fixture trees must not contain symbolic links (would re-open host paths under workdir)",
+        );
+      }
+      if (st.isDirectory()) {
+        stack.push(full);
+      }
+    }
+  }
+}
+
 async function makeTreeReadOnly(dir: string): Promise<void> {
   for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
     const full = path.join(dir, entry.name);
+    if (entry.isSymbolicLink()) {
+      throw new FixturePathError(
+        full,
+        "symlink escaped into workspace after fixture copy",
+      );
+    }
     if (entry.isDirectory()) {
       await makeTreeReadOnly(full);
       await fs.chmod(full, 0o555);

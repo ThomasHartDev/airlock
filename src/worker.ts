@@ -215,17 +215,17 @@ async function runInWorkerWithFs<T>(
 
   return new Promise<RunResult<T>>((resolve) => {
     let settled = false;
-    // terminate() is fire-and-forget: the OS reclaims the thread even if the
-    // promise races with a late message. finish is the single exit path so
-    // deadline, abort, OOM, and normal completion all hard-kill the isolate.
+    // finish is the single exit path: terminate the isolate first, then wipe
+    // the workdir so dispose cannot race a still-live guest (guaranteed wipe).
     const finish = (result: RunResult<T>) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       if (signal) signal.removeEventListener("abort", onAbort);
-      void worker.terminate();
-      const done = ws ? ws.dispose() : Promise.resolve();
-      void done.finally(() => resolve(result));
+      void worker
+        .terminate()
+        .finally(() => (ws ? ws.dispose() : Promise.resolve()))
+        .finally(() => resolve(result));
     };
 
     const timer = setTimeout(() => {
