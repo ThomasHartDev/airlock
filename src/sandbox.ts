@@ -1,8 +1,18 @@
 import * as vm from "node:vm";
 import type { Assertion, RunResult } from "./contract.js";
+import {
+  createEphemeralWorkspace,
+  type EphemeralFsOptions,
+} from "./ephemeral-fs.js";
 import { buildSandboxRequire } from "./modules.js";
 import { runVerified } from "./run.js";
 
+/**
+ * Ambient authority the host process carries that untrusted code must never
+ * reach unless the caller hands it in explicitly. This list is the machine
+ * form of the zero-credential invariant: with an empty grant, every one of
+ * these must be unbound inside the context.
+ */
 const AMBIENT_AUTHORITY = [
   "process",
   "require",
@@ -25,10 +35,15 @@ export const DENIED_AMBIENT_NAMES: readonly string[] = AMBIENT_AUTHORITY;
 export interface SandboxRunOptions<T> {
   timeoutMs: number;
   assert: Assertion<T>;
-
+  /** Capabilities the caller chooses to hand in. This is the only authority the code gets. */
   grant?: Readonly<Record<string, unknown>>;
-
+  /**
+   * Builtin/package ids the sandbox may load via `require`. Omitted means no
+   * `require` at all; `[]` injects a require that denies every specifier.
+   */
   allowedModules?: readonly string[];
+  /** Per-run private dir as `workdir`, wiped on exit. `true` = empty workspace. */
+  ephemeralFs?: true | EphemeralFsOptions;
   signal?: AbortSignal;
   filename?: string;
   maxOutputBytes?: number;
@@ -49,6 +64,11 @@ export class ZeroCredentialViolation extends Error {
 
 const SYNC_TIMEOUT_CODE = "ERR_SCRIPT_EXECUTION_TIMEOUT";
 
+/**
+ * Returns the ambient names that resolve to something bound inside `context`
+ * and were not part of the grant. A clean context returns an empty array; a
+ * non-empty result means authority leaked in and the run must be refused.
+ */
 export function probeAmbientAuthority(
   context: vm.Context,
   granted: readonly string[],
@@ -64,6 +84,23 @@ export function probeAmbientAuthority(
   return leaked;
 }
 
+/**
+ * Run untrusted source in a fresh V8 context with no ambient authority, then
+ * gate the result through the deadline and post-condition contract. The value
+ * comes back only as `{ status: "ok" }`, same as {@link runVerified}.
+ *
+ * Two independent deadline enforcers compose here: V8's own `timeout` preempts
+ * a synchronous spin that would otherwise wedge the event loop, and the
+ * async deadline in `runVerified` aborts a task that hangs on an unresolved
+ * promise. Neither alone covers both cases.
+ *
+ * This in-process tier denies *direct* ambient access (`process`, `require`,
+ * `fetch`, timers) and fails closed if any leaks in. It is not an escape-proof
+ * boundary: `this.constructor.constructor` still reaches the host realm's
+ * `Function` because the context's global borrows the host `Object`. Closing
+ * that is the job of the isolate and container tiers; see the escape-attempt
+ * tests for the pinned gap.
+ */
 export async function run<T>(
   code: string,
   opts: SandboxRunOptions<T>,
@@ -73,46 +110,60 @@ export async function run<T>(
     assert,
     grant,
     allowedModules,
+    ephemeralFs,
     signal,
     filename,
     maxOutputBytes,
   } = opts;
 
-  const bindings: Record<string, unknown> = { ...(grant ?? {}) };
-  // allowedModules wins over grant.require so the allowlist cannot be bypassed
-  if (allowedModules !== undefined) {
-    bindings.require = buildSandboxRequire(allowedModules);
-  }
+  const workspace =
+    ephemeralFs === undefined
+      ? null
+      : await createEphemeralWorkspace(ephemeralFs === true ? {} : ephemeralFs);
 
-  const context = vm.createContext(bindings);
-  const leaked = probeAmbientAuthority(context, Object.keys(bindings));
-  if (leaked.length > 0) throw new ZeroCredentialViolation(leaked);
-
-  let script: vm.Script;
   try {
-    script = new vm.Script(code, { filename: filename ?? "airlock-sandbox.js" });
-  } catch (error) {
-    return { status: "error", verified: false, error };
-  }
+    // allowedModules always wins over a grant-supplied require so a caller cannot
+    // accidentally re-open full host require while intending an allowlist.
+    const bindings: Record<string, unknown> = { ...(grant ?? {}) };
+    if (allowedModules !== undefined) {
+      bindings.require = buildSandboxRequire(allowedModules);
+    }
+    if (workspace) bindings.workdir = workspace.root;
 
-  const result = await runVerified<T>(
-    () =>
-      script.runInContext(context, {
-        timeout: timeoutMs,
-        breakOnSigint: true,
-      }) as T | Promise<T>,
-    {
-      timeoutMs,
-      assert,
-      ...(signal ? { signal } : {}),
-      ...(maxOutputBytes !== undefined ? { maxOutputBytes } : {}),
-    },
-  );
+    const context = vm.createContext(bindings);
+    const leaked = probeAmbientAuthority(context, Object.keys(bindings));
+    if (leaked.length > 0) throw new ZeroCredentialViolation(leaked);
 
-  if (result.status === "error" && isSyncTimeout(result.error)) {
-    return { status: "timeout", verified: false, timeoutMs };
+    let script: vm.Script;
+    try {
+      script = new vm.Script(code, {
+        filename: filename ?? "airlock-sandbox.js",
+      });
+    } catch (error) {
+      return { status: "error", error };
+    }
+
+    const result = await runVerified<T>(
+      () =>
+        script.runInContext(context, {
+          timeout: timeoutMs,
+          breakOnSigint: true,
+        }) as T | Promise<T>,
+      {
+        timeoutMs,
+        assert,
+        ...(signal ? { signal } : {}),
+        ...(maxOutputBytes !== undefined ? { maxOutputBytes } : {}),
+      },
+    );
+
+    if (result.status === "error" && isSyncTimeout(result.error)) {
+      return { status: "timeout", timeoutMs };
+    }
+    return result;
+  } finally {
+    if (workspace) await workspace.dispose();
   }
-  return result;
 }
 
 function isSyncTimeout(error: unknown): boolean {
