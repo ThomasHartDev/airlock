@@ -29,6 +29,8 @@
     "untrusted-code",
     "agent-safety",
     "capability-security",
+    "docker",
+    "container-isolation",
     "typescript"
   ],
   "license": "MIT",
