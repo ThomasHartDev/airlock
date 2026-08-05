@@ -12,6 +12,7 @@ export type { WorkerRunOptions } from "./worker.js";
 export {
   runInDocker, dockerSecurityArgs, isDockerAvailable, uniqueContainerName,
   wireByteLimit, DEFAULT_DOCKER_IMAGE, DEFAULT_MAX_WIRE_BYTES, DOCKER_CONTAINER_NAME_PREFIX,
+  DOCKER_WIRE_PREFIX,
 } from "./docker.js";
 export type { DockerRunOptions, DockerSecurityOptions } from "./docker.js";
 export {

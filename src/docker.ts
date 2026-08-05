@@ -3,22 +3,30 @@ import { spawn } from "node:child_process";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { deserialize } from "node:v8";
 import type { Assertion, RunResult } from "./contract.js";
 import { checkOutputSize, validateResourceLimits } from "./limits.js";
 
 export const DEFAULT_DOCKER_IMAGE = "node:20-alpine";
 export const DOCKER_CONTAINER_NAME_PREFIX = "airlock-";
 export const DEFAULT_MAX_WIRE_BYTES = 1_048_576;
+/** Framed result line prefix: AIRLOCK1:<base64(v8.serialize(envelope))> */
+export const DOCKER_WIRE_PREFIX = "AIRLOCK1:";
 const WIRE_FRAMING_SLACK = 65_536;
 const STDERR_DIAG_CAP = 4_096;
 const SYNC_TIMEOUT_CODE = "ERR_SCRIPT_EXECUTION_TIMEOUT";
 const OOM_EXIT = 137;
+const FORCE_RM_TIMEOUT_MS = 5_000;
 
 export interface DockerRunOptions<T> {
   timeoutMs: number;
   assert: Assertion<T>;
   /** JSON-serializable capabilities only. */
   grant?: Readonly<Record<string, unknown>>;
+  /**
+   * Container cgroup memory ceiling in MiB (also reported as
+   * `maxOldGenerationSizeMb` on out-of-memory for RunResult union parity).
+   */
   maxMemoryMb?: number;
   maxOutputBytes?: number;
   signal?: AbortSignal;
@@ -54,12 +62,16 @@ export function dockerSecurityArgs(opts: DockerSecurityOptions = {}): string[] {
 
 // Guest is self-contained. settleWithDeadline covers never-settling async:
 // cross-realm vm Promises do not pin the event loop on their own.
+// Result channel is v8.serialize (structured clone) framed as AIRLOCK1:<base64>
+// so NaN/Infinity/Map/Date/TypedArray round-trip; non-cloneable values fail closed.
 
 const GUEST_SOURCE = [
   "'use strict';",
-  "const fs=require('node:fs'),vm=require('node:vm');",
+  "const fs=require('node:fs'),vm=require('node:vm'),v8=require('node:v8');",
+  "function frame(msg){return 'AIRLOCK1:'+v8.serialize(msg).toString('base64')+'\\n';}",
+  "function emit(msg){try{fs.writeSync(1,frame(msg));}catch(ser){try{fs.writeSync(1,frame({ok:false,error:{name:'TypeError',message:String(ser&&ser.message||ser),code:'ERR_AIRLOCK_VALUE_NOT_CLONEABLE'}}));}catch(_){fs.writeSync(1,'AIRLOCK1:FAIL\\n');}}}",
   "function settleWithDeadline(v,ms){return new Promise((res,rej)=>{const t=setTimeout(()=>{const e=new Error('deadline exceeded');Object.defineProperty(e,'code',{value:'ERR_SCRIPT_EXECUTION_TIMEOUT'});rej(e);},ms);Promise.resolve(v).then(x=>{clearTimeout(t);res(x);},e=>{clearTimeout(t);rej(e);});});}",
-  "(async()=>{try{const p=JSON.parse(fs.readFileSync('/airlock/payload.json','utf8'));const c=vm.createContext(Object.assign({},p.grant||{}));const s=new vm.Script(p.code,{filename:p.filename||'airlock-docker.js'});const value=await settleWithDeadline(s.runInContext(c,{timeout:p.timeoutMs}),p.timeoutMs);fs.writeSync(1,JSON.stringify({ok:true,value})+'\\n');}catch(error){fs.writeSync(1,JSON.stringify({ok:false,error:{name:error&&error.name,message:error&&error.message,stack:error&&error.stack,code:error&&error.code}})+'\\n');}})();",
+  "(async()=>{try{const p=JSON.parse(fs.readFileSync('/airlock/payload.json','utf8'));const c=vm.createContext(Object.assign({},p.grant||{}));const s=new vm.Script(p.code,{filename:p.filename||'airlock-docker.js'});const value=await settleWithDeadline(s.runInContext(c,{timeout:p.timeoutMs}),p.timeoutMs);emit({ok:true,value});}catch(error){emit({ok:false,error:{name:error&&error.name,message:error&&error.message,stack:error&&error.stack,code:error&&error.code}});}})();",
 ].join("\n");
 
 type GuestErr = { name?: string; message?: string; stack?: string; code?: string };
@@ -70,6 +82,10 @@ type SpawnSignal = "timeout" | "abort" | "output-too-large" | null;
  * Run untrusted source in Docker (`--network=none`, `--read-only`, dropped
  * caps, no host env) behind the same {@link RunResult} contract as
  * {@link run} / {@link runInWorker}. Requires a docker daemon.
+ *
+ * Return values cross the host boundary via `v8.serialize` / `v8.deserialize`
+ * (structured clone), matching worker fidelity for Map/Date/TypedArray/NaN/
+ * Infinity. Non-cloneable values fail closed as `status: "error"`.
  */
 
 export async function runInDocker<T>(
@@ -239,8 +255,22 @@ function forceRemoveContainer(dockerPath: string, name: string): Promise<void> {
       stdio: "ignore",
       env: dockerCliEnv(),
     });
-    killer.on("error", () => resolve());
-    killer.on("close", () => resolve());
+    const timer = setTimeout(() => {
+      try {
+        killer.kill("SIGKILL");
+      } catch {
+        /* gone */
+      }
+      resolve();
+    }, FORCE_RM_TIMEOUT_MS);
+    killer.on("error", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+    killer.on("close", () => {
+      clearTimeout(timer);
+      resolve();
+    });
   });
 }
 
@@ -248,9 +278,11 @@ function parseGuestStdout(stdout: string): GuestMessage | null {
   const lines = stdout.split("\n").map((l) => l.trim()).filter(Boolean);
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i];
-    if (!line?.startsWith("{")) continue;
+    if (!line?.startsWith(DOCKER_WIRE_PREFIX)) continue;
+    const b64 = line.slice(DOCKER_WIRE_PREFIX.length);
+    if (!b64 || b64 === "FAIL") continue;
     try {
-      const parsed: unknown = JSON.parse(line);
+      const parsed: unknown = deserialize(Buffer.from(b64, "base64"));
       if (
         typeof parsed === "object" &&
         parsed !== null &&
