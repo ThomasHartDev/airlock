@@ -23,6 +23,21 @@ export {
   checkOutputSize,
 } from "./limits.js";
 export type { ResourceLimits, OutputSizeCheck } from "./limits.js";
+export {
+  serializeError,
+  toJsonResult,
+  exitCodeFor,
+  stringifyJsonResult,
+  compileAssertExpr,
+  runSource,
+  runFile,
+} from "./run-file.js";
+export type {
+  JsonError,
+  JsonRunResult,
+  ExecutorTier,
+  RunFileOptions,
+} from "./run-file.js";
 export type {
   Assertion,
   RunResult,

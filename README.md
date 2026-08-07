@@ -6,7 +6,7 @@ Ephemeral, zero-credential, self-verifying execution for untrusted or agent-writ
 
 An airlock is the safe way to run code you do not trust: an LLM-generated snippet, a plugin, a user-submitted function. This repo builds that primitive from the ground up in TypeScript. The guarantee is that a caller never reads an output unless the run stayed inside its resource ceilings and its output satisfies a post-condition the caller supplied. Untrusted code is guilty until proven correct, and the type system makes you prove it before you can touch the value.
 
-The first slice was the contract and the in-process runner that enforces it. The second slice added `run(code, opts)`, which executes untrusted source in a fresh `node:vm` context with no ambient authority. The third slice added `runInWorker(code, opts)`: the same contract on a `worker_threads` isolate with frozen globals and an empty env. The fourth slice hardens the **resource limit** layer: wall-clock deadline with hard terminate on abort, V8 heap cap, and output size caps. This slice adds a **deny-by-default module loader**: untrusted code has no `require` unless the caller opts in with `allowedModules`, and only the listed builtin or package ids resolve. Relative and absolute paths are always refused. Later slices add a Docker-backed tier and a growing suite of documented escape-attempt tests.
+The first slice was the contract and the in-process runner that enforces it. The second slice added `run(code, opts)`, which executes untrusted source in a fresh `node:vm` context with no ambient authority. The third slice added `runInWorker(code, opts)`: the same contract on a `worker_threads` isolate with frozen globals and an empty env. The fourth slice hardens the **resource limit** layer: wall-clock deadline with hard terminate on abort, V8 heap cap, and output size caps. Module loading is deny-by-default via `allowedModules`. This slice adds the **`airlock run <file>` CLI** and a programmatic `runFile` / `runSource` API that return a structured JSON result, so agents and shell pipelines can consume every outcome without special-casing thrown `Error` values.
 
 ## Concepts demonstrated
 
@@ -26,6 +26,8 @@ The first slice was the contract and the in-process runner that enforces it. The
 - **Deny-by-default module loading.** `require` is unbound unless the caller sets `allowedModules`. An empty list injects a gate that refuses every specifier; a non-empty list is an exact-match allowlist (with bare/`node:` equivalence), never a prefix grant.
 - **Capability allowlists.** Module loading is treated as ambient authority: the host's real `require` is reachable only after the gate admits the id, so unlisted builtins like `fs` stay closed even when a sibling id is granted.
 - **Path-specifier refusal.** Relative and absolute paths are dropped from the allowlist and rejected at load time so filesystem resolution cannot re-open host I/O through a crafty entry.
+- **Structured result DTOs + exit codes.** `RunResult` maps to a JSON envelope (`JsonRunResult`) with Error DTOs; exit `0` only for `ok`, `1` for sandbox refusals, `2` for CLI/IO failures.
+- **CLI as a process-boundary adapter.** Argv and file I/O stay outside the sandbox; the untrusted payload is the file body, while `--assert` is a host-side expression over the returned value.
 - **Strict TypeScript.** `strict`, `noUncheckedIndexedAccess`, and `exactOptionalPropertyTypes`, no `any`.
 
 ## The primitive contract
@@ -149,6 +151,28 @@ await run("require('path')", {
 // -> { status: "error", error: ModuleNotAllowedError }
 ```
 
+### CLI and structured JSON
+
+`airlock run <file>` prints one JSON result to stdout. Exit `0` only for `status: "ok"`, `1` for sandbox refusals, `2` for usage/IO errors.
+
+```bash
+pnpm run build
+echo '21 * 2' > /tmp/snippet.js
+node dist/cli.js run /tmp/snippet.js --timeout 200 --assert 'value === 42'
+# {"status":"ok","value":42,"durationMs":...}
+```
+
+```ts
+import { runFile } from "airlock";
+const result = await runFile("./snippet.js", {
+  timeoutMs: 200,
+  assertExpr: "value === 42",
+});
+if (result.status === "ok") console.log(result.value);
+```
+
+Flags: `--tier sandbox|worker`, `--grant`, `--allow-module`, `--max-output-bytes`, `--max-old-gen-mb`.
+
 ## Develop
 
 ```bash
@@ -165,3 +189,4 @@ pnpm run build
 - `src/worker.ts`: `runInWorker(code, opts)` runs untrusted source in a `worker_threads` isolate started with an empty `process.env` and frozen globals, caps the heap with `maxOldGenerationSizeMb` (reported as `out-of-memory`), and hard-kills the thread on the deadline so a sync spin and a never-settling async task are both preempted. An escape-attempt test confirms the constructor walk that reaches the host realm in-process reaches only the credential-free worker realm here.
 - `src/limits.ts`: shared resource ceilings for every tier. Wall-clock timeout aborts the task signal and, on the worker tier, calls `worker.terminate()` on both deadline and caller abort. Heap cap via V8 `resourceLimits`. Output size caps (`maxOutputBytes`) measure UTF-8 payload with a budgeted walk (cycle-safe, early-exit) and refuse with `output-too-large` before the post-condition runs.
 - `src/modules.ts`: deny-by-default module loader with an explicit `allowedModules` allowlist. Omitted means no `require`; `[]` or a list injects `createGatedRequire` over the host/worker require. Exact match only (bare and `node:` equivalent), path specifiers always refused, and the gate wins over a grant-supplied `require`. Wired into both `run` and `runInWorker`.
+- `src/cli.ts` + `src/run-file.ts`: `airlock run <file>` CLI and programmatic `runFile` / `runSource` API with structured JSON results, exit-code mapping, host-side `--assert` expressions, and tier/grant/module flags.
