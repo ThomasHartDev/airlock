@@ -153,7 +153,7 @@ await run("require('path')", {
 
 ### CLI and structured JSON
 
-`airlock run <file>` prints one JSON result to stdout. Exit `0` only for `status: "ok"`, `1` for sandbox refusals, `2` for usage/IO errors.
+`airlock run <file>` prints **one JSON result** to stdout for every run invocation (including failed post-conditions and assert compile failures). Exit `0` only for `status: "ok"`, `1` for sandbox refusals and assert/runtime errors, `2` only for usage parse failures and file IO (`io-error`).
 
 ```bash
 pnpm run build
@@ -172,6 +172,10 @@ if (result.status === "ok") console.log(result.value);
 ```
 
 Flags: `--tier sandbox|worker`, `--grant`, `--allow-module`, `--max-output-bytes`, `--max-old-gen-mb`.
+
+**Host-privileged assert.** `--assert` / `assertExpr` is compiled with `new Function` in the **host** realm, not inside the sandbox. The expression can reach `process` and other host globals. Treat it as trusted operator input, same trust level as the caller process. Untrusted code is only the file body.
+
+Invalid or empty assert expressions do not reject: they return `{ status: "error", error: ... }` (CLI exit `1`) so agents always parse one JSON envelope.
 
 ## Develop
 

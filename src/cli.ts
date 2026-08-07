@@ -26,7 +26,8 @@ const USAGE = `Usage: airlock run <file> [options]
   --timeout <ms>  --assert <expr>  --tier sandbox|worker
   --grant <json>  --allow-module <id>  --max-output-bytes <n>
   --max-old-gen-mb <n>  -h, --help
-Exit: 0 ok, 1 refusal, 2 usage/io.
+Exit: 0 ok, 1 refusal (incl. assert compile/runtime), 2 usage/io.
+--assert is host-privileged (new Function in the host realm).
 `;
 
 function fail(message: string, showHelp?: boolean): ParseResult {
@@ -127,23 +128,17 @@ export async function main(argv: string[], io: CliIo = process): Promise<number>
     grant = g.grant;
   }
 
-  let result: JsonRunResult;
-  try {
-    result = await runFile(args.file, {
-      timeoutMs: args.timeoutMs,
-      tier: args.tier,
-      ...(args.assertExpr !== undefined ? { assertExpr: args.assertExpr } : {}),
-      ...(grant ? { grant } : {}),
-      ...(args.allowedModules.length > 0 ? { allowedModules: args.allowedModules } : {}),
-      ...(args.maxOutputBytes !== undefined ? { maxOutputBytes: args.maxOutputBytes } : {}),
-      ...(args.maxOldGenerationSizeMb !== undefined
-        ? { maxOldGenerationSizeMb: args.maxOldGenerationSizeMb }
-        : {}),
-    });
-  } catch (error) {
-    io.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-    return 2;
-  }
+  const result = await runFile(args.file, {
+    timeoutMs: args.timeoutMs,
+    tier: args.tier,
+    ...(args.assertExpr !== undefined ? { assertExpr: args.assertExpr } : {}),
+    ...(grant ? { grant } : {}),
+    ...(args.allowedModules.length > 0 ? { allowedModules: args.allowedModules } : {}),
+    ...(args.maxOutputBytes !== undefined ? { maxOutputBytes: args.maxOutputBytes } : {}),
+    ...(args.maxOldGenerationSizeMb !== undefined
+      ? { maxOldGenerationSizeMb: args.maxOldGenerationSizeMb }
+      : {}),
+  });
 
   io.stdout.write(`${stringifyJsonResult(result)}\n`);
   return exitCodeFor(result);
@@ -151,7 +146,14 @@ export async function main(argv: string[], io: CliIo = process): Promise<number>
 
 const entry = process.argv[1];
 if (entry !== undefined && import.meta.url === pathToFileURL(entry).href) {
-  void main(process.argv.slice(2)).then((code) => {
-    process.exitCode = code;
-  });
+  void main(process.argv.slice(2))
+    .then((code) => {
+      process.exitCode = code;
+    })
+    .catch((error: unknown) => {
+      process.stderr.write(
+        `${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      process.exitCode = 2;
+    });
 }

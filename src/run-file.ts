@@ -110,34 +110,35 @@ export function compileAssertExpr(expr: string): Assertion<unknown> {
   const fn = new Function("value", `return (${trimmed});`) as (
     value: unknown,
   ) => unknown;
-  return (value) => Boolean(fn(value));
+  // Await then coerce: Promise-returning exprs must settle before Boolean().
+  return async (value) => Boolean(await fn(value));
 }
 
 export async function runSource(
   code: string,
   opts: RunFileOptions = {},
 ): Promise<JsonRunResult> {
-  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const assert =
-    opts.assert ??
-    (opts.assertExpr !== undefined
-      ? compileAssertExpr(opts.assertExpr)
-      : () => true);
-  const common = {
-    timeoutMs,
-    assert,
-    filename: opts.filename ?? "airlock-run.js",
-    ...(opts.grant ? { grant: opts.grant } : {}),
-    ...(opts.allowedModules !== undefined
-      ? { allowedModules: opts.allowedModules }
-      : {}),
-    ...(opts.signal ? { signal: opts.signal } : {}),
-    ...(opts.maxOutputBytes !== undefined
-      ? { maxOutputBytes: opts.maxOutputBytes }
-      : {}),
-  };
-
   try {
+    const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const assert =
+      opts.assert ??
+      (opts.assertExpr !== undefined
+        ? compileAssertExpr(opts.assertExpr)
+        : () => true);
+    const common = {
+      timeoutMs,
+      assert,
+      filename: opts.filename ?? "airlock-run.js",
+      ...(opts.grant ? { grant: opts.grant } : {}),
+      ...(opts.allowedModules !== undefined
+        ? { allowedModules: opts.allowedModules }
+        : {}),
+      ...(opts.signal ? { signal: opts.signal } : {}),
+      ...(opts.maxOutputBytes !== undefined
+        ? { maxOutputBytes: opts.maxOutputBytes }
+        : {}),
+    };
+
     if ((opts.tier ?? "sandbox") === "worker") {
       return toJsonResult(
         await runInWorker(code, {
@@ -163,7 +164,7 @@ export async function runFile(
   }
   try {
     const code = await readFile(path, "utf8");
-    return runSource(code, { ...opts, filename: opts.filename ?? path });
+    return await runSource(code, { ...opts, filename: opts.filename ?? path });
   } catch (error) {
     return {
       status: "io-error",
