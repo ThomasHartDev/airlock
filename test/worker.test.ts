@@ -142,8 +142,7 @@ describe("worker zero-credential invariant", () => {
     const key = "AIRLOCK_HOST_SECRET";
     process.env[key] = "super-secret-token";
     try {
-      // Reach the worker realm's process via the constructor walk that escapes
-      // the vm context, then read env. The host secret must not be there.
+      // constructor walk escapes vm; host secret must not be readable
       const result = await runInWorker<string>(
         `this.constructor.constructor("return typeof process.env.${key}")()`,
         { timeoutMs: 1000, assert: (v) => v === "undefined" },

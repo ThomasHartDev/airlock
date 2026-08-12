@@ -3,16 +3,6 @@ import { checkOutputSize, validateResourceLimits } from "./limits.js";
 
 const DEADLINE = Symbol("deadline");
 
-/**
- * The core airlock primitive. Runs `task` under a deadline, then checks the
- * supplied post-condition, and hands back the value only when both pass.
- *
- * The deadline is enforced by racing an internal timer and aborting the signal
- * the task receives. That stops async and cooperative work, but a task that
- * blocks the event loop with a synchronous spin cannot be interrupted here;
- * true preemption is the job of the isolate and container tiers built on top
- * of this contract.
- */
 export async function runVerified<T>(
   task: Task<T>,
   opts: VerifiedRunOptions<T>,
@@ -40,8 +30,7 @@ export async function runVerified<T>(
 
   const started = performance.now();
   const running = Promise.resolve().then(() => task(controller.signal));
-  // A task that loses the race still settles; swallow late rejections so they
-  // don't surface as unhandled once we've already returned a timeout.
+  // swallow late rejections after timeout so they are not unhandled
   running.catch(() => {});
 
   try {

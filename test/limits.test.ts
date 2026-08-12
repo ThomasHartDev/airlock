@@ -54,14 +54,14 @@ describe("measureOutputBytes", () => {
   });
 
   it("counts UTF-8 string payload, not code units", () => {
-    // "€" is one code point, three UTF-8 bytes
+
     expect(measureOutputBytes("€").bytes).toBe(3);
     expect(measureOutputBytes("hi").bytes).toBe(2);
   });
 
   it("walks arrays and plain objects", () => {
     expect(measureOutputBytes([1, 2]).bytes).toBe(16);
-    expect(measureOutputBytes({ a: "bb" }).bytes).toBe(3); // key "a" + "bb"
+    expect(measureOutputBytes({ a: "bb" }).bytes).toBe(3);
   });
 
   it("stops once the budget is exceeded", () => {
@@ -194,7 +194,7 @@ describe("wall-clock timeout terminates the worker on abort", () => {
     const elapsed = performance.now() - started;
 
     expect(result).toEqual({ status: "timeout", timeoutMs: 80 });
-    // terminate() should reclaim the thread promptly after the timer fires
+
     expect(elapsed).toBeLessThan(1500);
   });
 

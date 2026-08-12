@@ -138,7 +138,6 @@ describe("zero-credential invariant", () => {
     const dirty = vm.createContext({ process });
     const leaked = probeAmbientAuthority(dirty, []);
     expect(leaked).toContain("process");
-    // an explicit grant of the same name is authority the caller chose, not a leak
     expect(probeAmbientAuthority(dirty, ["process"])).not.toContain("process");
 
     const violation = new ZeroCredentialViolation(leaked);
@@ -155,8 +154,6 @@ describe("documented escape attempts", () => {
       { timeoutMs: 100, assert: () => true },
     );
 
-    // The per-context Object's Function compiles in the sandbox realm, so the
-    // host `process` stays out of reach.
     expect(result).toMatchObject({ status: "ok", value: "undefined" });
   });
 
@@ -166,9 +163,6 @@ describe("documented escape attempts", () => {
       { timeoutMs: 100, assert: () => true },
     );
 
-    // `this.constructor` borrows the HOST `Object`, so its Function escapes the
-    // context. node:vm cannot close this in-process; the isolate and container
-    // tiers do. This test documents the boundary rather than pretending it holds.
     expect(result).toMatchObject({ status: "ok", value: "object" });
   });
 });

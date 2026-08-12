@@ -10,11 +10,6 @@ export class ModuleNotAllowedError extends Error {
   }
 }
 
-/**
- * Allowlist stores both bare and node: forms so listing either is enough.
- * Path-like specifiers are never admitted: allowlists are for package/builtin
- * ids, not filesystem resolution that would re-open ambient I/O.
- */
 export function expandAllowlist(modules: readonly string[]): ReadonlySet<string> {
   const allowed = new Set<string>();
   for (const id of modules) {
@@ -48,11 +43,6 @@ export function isModuleAllowed(
   return allowed.has(bare) || allowed.has(`node:${bare}`);
 }
 
-/**
- * Self-contained so the worker bootstrap can inject it via Function#toString.
- * hostRequire is the only capability that can actually load; this gate only
- * decides whether that capability is invoked.
- */
 export function createGatedRequire(
   allowedModules: readonly string[],
   hostRequire: (id: string) => unknown,
@@ -75,9 +65,8 @@ export function createGatedRequire(
 
   return function gatedRequire(id: string): unknown {
     const deny = (specifier: string): never => {
-      // defineProperty (not assignment): freezeRealm freezes Error.prototype, so
-      // `err.name = ...` throws TypeError in the worker isolate.
       const err = new Error(`module not allowed: ${specifier}`);
+      // defineProperty: freezeRealm freezes Error.prototype so assignment throws
       Object.defineProperty(err, "name", {
         value: "ModuleNotAllowedError",
         configurable: true,

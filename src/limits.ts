@@ -1,13 +1,7 @@
-/**
- * Resource ceilings shared by every airlock tier. Wall-clock and heap are
- * enforced by the runner (timer + worker.terminate / V8 resourceLimits);
- * output size is measured on the host after the value crosses the boundary,
- * so a huge return cannot pass the post-condition or land as a trusted result.
- */
 export interface ResourceLimits {
   timeoutMs: number;
   maxOldGenerationSizeMb?: number;
-  /** UTF-8 payload of the returned value. Exceeding refuses with output-too-large. */
+
   maxOutputBytes?: number;
 }
 
@@ -38,11 +32,6 @@ export function validateResourceLimits(limits: ResourceLimits): void {
   }
 }
 
-/**
- * Walks a value counting UTF-8 payload bytes until `budget` is exceeded, then
- * stops. Cycles contribute 0 after the first visit so a self-referential object
- * cannot hang the host meter.
- */
 export function measureOutputBytes(
   value: unknown,
   budget: number = Number.POSITIVE_INFINITY,

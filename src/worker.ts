@@ -3,11 +3,6 @@ import type { Assertion, RunResult } from "./contract.js";
 import { checkOutputSize, validateResourceLimits } from "./limits.js";
 import { createGatedRequire } from "./modules.js";
 
-/**
- * Intrinsics whose prototypes a sandbox escape could otherwise repave to attack
- * later runs sharing the isolate. Frozen in the worker realm before any
- * untrusted code runs, so an escape lands in a realm it cannot mutate.
- */
 export const FROZEN_INTRINSICS: readonly string[] = [
   "Object",
   "Function",
@@ -30,7 +25,6 @@ export const FROZEN_INTRINSICS: readonly string[] = [
   "Reflect",
 ];
 
-/** Freeze each named intrinsic, its prototype, and the realm root itself. */
 export function freezeRealm(
   root: Record<string, unknown>,
   names: readonly string[],
@@ -52,16 +46,13 @@ export function freezeRealm(
 export interface WorkerRunOptions<T> {
   timeoutMs: number;
   assert: Assertion<T>;
-  /** Structured-cloneable capabilities only; live functions can't cross the thread boundary. */
+
   grant?: Readonly<Record<string, unknown>>;
-  /**
-   * Builtin/package ids the isolate may load via `require`. Omitted means no
-   * `require`; `[]` injects a require that denies every specifier.
-   */
+
   allowedModules?: readonly string[];
-  /** Hard cap on the isolate's V8 old-space. Exceeding it kills the worker. */
+
   maxOldGenerationSizeMb?: number;
-  /** Refuse values whose measured UTF-8 payload exceeds this many bytes. */
+
   maxOutputBytes?: number;
   signal?: AbortSignal;
   filename?: string;
@@ -80,9 +71,7 @@ type WorkerMessage = WorkerOk | WorkerErr;
 const SYNC_TIMEOUT_CODE = "ERR_SCRIPT_EXECUTION_TIMEOUT";
 const OOM_CODE = "ERR_WORKER_OUT_OF_MEMORY";
 
-// The worker body is a string so a single build artifact ships without a
-// separate worker entry file, and so tests exercise the same code as dist.
-// freezeRealm + createGatedRequire are injected by source and applied inside.
+// worker body is a string so dist ships without a separate worker entry
 const BOOTSTRAP = `
 'use strict';
 const { workerData, parentPort } = require('node:worker_threads');
@@ -97,8 +86,6 @@ const createGatedRequire = ${createGatedRequire.toString()};
   try {
     const { code, grant, timeoutMs, filename, allowedModules } = workerData;
     const bindings = { ...(grant || {}) };
-    // eval workers have no real __filename; anchor createRequire on cwd so
-    // builtins resolve and relative paths still hit the path-specifier deny.
     if (Array.isArray(allowedModules)) {
       const hostRequire = createRequire(path.join(process.cwd(), 'airlock-worker.js'));
       bindings.require = createGatedRequire(allowedModules, hostRequire);
@@ -121,25 +108,6 @@ const createGatedRequire = ${createGatedRequire.toString()};
 })();
 `;
 
-/**
- * Run untrusted source in a worker_threads isolate: a separate V8 heap on a
- * separate OS thread, started with an empty `process.env` and frozen globals,
- * then gated through the deadline and post-condition contract.
- *
- * This is the stronger sibling of the in-process {@link run}. It closes the
- * pinned in-process gap where `this.constructor.constructor` reaches the host
- * realm: here an escape from the `vm` context reaches only the WORKER's realm,
- * whose `process.env` is empty and whose globals are frozen.
- *
- * Resource ceilings: wall-clock deadline hard-kills the thread via
- * `worker.terminate()` (deadline and caller abort both terminate), V8
- * `maxOldGenerationSizeMb` reports `out-of-memory`, and `maxOutputBytes`
- * refuses oversized returns before the post-condition runs.
- *
- * The tradeoff for real thread isolation: the `grant` and the returned value
- * cross by structured clone, so live function capabilities can't be handed in
- * and non-cloneable outputs come back as an `error`.
- */
 export function runInWorker<T>(
   code: string,
   opts: WorkerRunOptions<T>,
@@ -186,14 +154,13 @@ export function runInWorker<T>(
 
   return new Promise<RunResult<T>>((resolve) => {
     let settled = false;
-    // terminate() is fire-and-forget: the OS reclaims the thread even if the
-    // promise races with a late message. finish is the single exit path so
-    // deadline, abort, OOM, and normal completion all hard-kill the isolate.
+
     const finish = (result: RunResult<T>) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       if (signal) signal.removeEventListener("abort", onAbort);
+      // terminate always: deadline, abort, OOM, and success all hard-kill isolate
       void worker.terminate();
       resolve(result);
     };
