@@ -1,9 +1,17 @@
 import { Worker } from "node:worker_threads";
 import type { Assertion, RunResult } from "./contract.js";
+import {
+  createEphemeralWorkspace,
+  type EphemeralFsOptions,
+} from "./ephemeral-fs.js";
 import { checkOutputSize, validateResourceLimits } from "./limits.js";
 import { createGatedRequire } from "./modules.js";
-import { selfVerify } from "./verify.js";
 
+/**
+ * Intrinsics whose prototypes a sandbox escape could otherwise repave to attack
+ * later runs sharing the isolate. Frozen in the worker realm before any
+ * untrusted code runs, so an escape lands in a realm it cannot mutate.
+ */
 export const FROZEN_INTRINSICS: readonly string[] = [
   "Object",
   "Function",
@@ -26,6 +34,7 @@ export const FROZEN_INTRINSICS: readonly string[] = [
   "Reflect",
 ];
 
+/** Freeze each named intrinsic, its prototype, and the realm root itself. */
 export function freezeRealm(
   root: Record<string, unknown>,
   names: readonly string[],
@@ -47,14 +56,19 @@ export function freezeRealm(
 export interface WorkerRunOptions<T> {
   timeoutMs: number;
   assert: Assertion<T>;
-
+  /** Structured-cloneable capabilities only; live functions can't cross the thread boundary. */
   grant?: Readonly<Record<string, unknown>>;
-
+  /**
+   * Builtin/package ids the isolate may load via `require`. Omitted means no
+   * `require`; `[]` injects a require that denies every specifier.
+   */
   allowedModules?: readonly string[];
-
+  /** Hard cap on the isolate's V8 old-space. Exceeding it kills the worker. */
   maxOldGenerationSizeMb?: number;
-
+  /** Refuse values whose measured UTF-8 payload exceeds this many bytes. */
   maxOutputBytes?: number;
+  /** Per-run private dir as `workdir`, wiped on exit. `true` = empty workspace. */
+  ephemeralFs?: true | EphemeralFsOptions;
   signal?: AbortSignal;
   filename?: string;
 }
@@ -72,7 +86,9 @@ type WorkerMessage = WorkerOk | WorkerErr;
 const SYNC_TIMEOUT_CODE = "ERR_SCRIPT_EXECUTION_TIMEOUT";
 const OOM_CODE = "ERR_WORKER_OUT_OF_MEMORY";
 
-// worker body is a string so dist ships without a separate worker entry
+// The worker body is a string so a single build artifact ships without a
+// separate worker entry file, and so tests exercise the same code as dist.
+// freezeRealm + createGatedRequire are injected by source and applied inside.
 const BOOTSTRAP = `
 'use strict';
 const { workerData, parentPort } = require('node:worker_threads');
@@ -87,6 +103,8 @@ const createGatedRequire = ${createGatedRequire.toString()};
   try {
     const { code, grant, timeoutMs, filename, allowedModules } = workerData;
     const bindings = { ...(grant || {}) };
+    // eval workers have no real __filename; anchor createRequire on cwd so
+    // builtins resolve and relative paths still hit the path-specifier deny.
     if (Array.isArray(allowedModules)) {
       const hostRequire = createRequire(path.join(process.cwd(), 'airlock-worker.js'));
       bindings.require = createGatedRequire(allowedModules, hostRequire);
@@ -109,7 +127,43 @@ const createGatedRequire = ${createGatedRequire.toString()};
 })();
 `;
 
+/**
+ * Run untrusted source in a worker_threads isolate: a separate V8 heap on a
+ * separate OS thread, started with an empty `process.env` and frozen globals,
+ * then gated through the deadline and post-condition contract.
+ *
+ * This is the stronger sibling of the in-process {@link run}. It closes the
+ * pinned in-process gap where `this.constructor.constructor` reaches the host
+ * realm: here an escape from the `vm` context reaches only the WORKER's realm,
+ * whose `process.env` is empty and whose globals are frozen.
+ *
+ * Resource ceilings: wall-clock deadline hard-kills the thread via
+ * `worker.terminate()` (deadline and caller abort both terminate), V8
+ * `maxOldGenerationSizeMb` reports `out-of-memory`, and `maxOutputBytes`
+ * refuses oversized returns before the post-condition runs.
+ *
+ * The tradeoff for real thread isolation: the `grant` and the returned value
+ * cross by structured clone, so live function capabilities can't be handed in
+ * and non-cloneable outputs come back as an `error`.
+ */
 export function runInWorker<T>(
+  code: string,
+  opts: WorkerRunOptions<T>,
+): Promise<RunResult<T>> {
+  // Validate before any await so bad limits still throw synchronously.
+  validateResourceLimits({
+    timeoutMs: opts.timeoutMs,
+    ...(opts.maxOldGenerationSizeMb !== undefined
+      ? { maxOldGenerationSizeMb: opts.maxOldGenerationSizeMb }
+      : {}),
+    ...(opts.maxOutputBytes !== undefined
+      ? { maxOutputBytes: opts.maxOutputBytes }
+      : {}),
+  });
+  return runInWorkerWithFs(code, opts);
+}
+
+async function runInWorkerWithFs<T>(
   code: string,
   opts: WorkerRunOptions<T>,
 ): Promise<RunResult<T>> {
@@ -120,14 +174,18 @@ export function runInWorker<T>(
     allowedModules,
     maxOldGenerationSizeMb,
     maxOutputBytes,
+    ephemeralFs,
     signal,
     filename,
   } = opts;
-  validateResourceLimits({
-    timeoutMs,
-    ...(maxOldGenerationSizeMb !== undefined ? { maxOldGenerationSizeMb } : {}),
-    ...(maxOutputBytes !== undefined ? { maxOutputBytes } : {}),
-  });
+
+  const workspace =
+    ephemeralFs === undefined
+      ? null
+      : await createEphemeralWorkspace(ephemeralFs === true ? {} : ephemeralFs);
+
+  const grantPayload: Record<string, unknown> = { ...(grant ?? {}) };
+  if (workspace) grantPayload.workdir = workspace.root;
 
   let worker: Worker;
   try {
@@ -136,7 +194,7 @@ export function runInWorker<T>(
       env: {},
       workerData: {
         code,
-        grant: grant ?? {},
+        grant: grantPayload,
         timeoutMs,
         filename: filename ?? "airlock-worker.js",
         allowedModules:
@@ -148,30 +206,34 @@ export function runInWorker<T>(
     });
   } catch (error) {
     // A non-cloneable grant (e.g. a function) fails at construction.
-    return Promise.resolve({ status: "error", verified: false, error });
+    if (workspace) await workspace.dispose();
+    return { status: "error", error };
   }
 
   const started = performance.now();
+  const ws = workspace;
 
   return new Promise<RunResult<T>>((resolve) => {
     let settled = false;
-
+    // finish is the single exit path: terminate the isolate first, then wipe
+    // the workdir so dispose cannot race a still-live guest (guaranteed wipe).
     const finish = (result: RunResult<T>) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       if (signal) signal.removeEventListener("abort", onAbort);
-      // terminate always: deadline, abort, OOM, and success all hard-kill isolate
-      void worker.terminate();
-      resolve(result);
+      void worker
+        .terminate()
+        .finally(() => (ws ? ws.dispose() : Promise.resolve()))
+        .finally(() => resolve(result));
     };
 
     const timer = setTimeout(() => {
-      finish({ status: "timeout", verified: false, timeoutMs });
+      finish({ status: "timeout", timeoutMs });
     }, timeoutMs);
 
     const onAbort = () => {
-      finish({ status: "error", verified: false, error: signal?.reason });
+      finish({ status: "error", error: signal?.reason });
     };
     if (signal) {
       if (signal.aborted) return onAbort();
@@ -188,72 +250,49 @@ export function runInWorker<T>(
           if (size.exceeded) {
             finish({
               status: "output-too-large",
-              verified: false,
               maxOutputBytes,
               actualBytes: size.bytes,
             });
             return;
           }
         }
-        void selfVerify(value, assert).then(
-          (check) => {
-            if (check.verified) {
-              finish({
-                status: "ok",
-                verified: true,
-                value: check.value,
-                durationMs: performance.now() - started,
-              });
-              return;
-            }
+        void Promise.resolve(assert(value)).then(
+          (passed) =>
             finish(
-              check.reason !== undefined
+              passed
                 ? {
-                    status: "assertion-failed",
-                    verified: false,
-                    value: check.value,
-                    reason: check.reason,
+                    status: "ok",
+                    value,
+                    durationMs: performance.now() - started,
                   }
-                : {
-                    status: "assertion-failed",
-                    verified: false,
-                    value: check.value,
-                  },
-            );
-          },
-          (error: unknown) =>
-            finish({ status: "error", verified: false, error }),
+                : { status: "assertion-failed", value },
+            ),
+          (error) => finish({ status: "error", error }),
         );
         return;
       }
       if (msg.error.code === SYNC_TIMEOUT_CODE) {
-        finish({ status: "timeout", verified: false, timeoutMs });
+        finish({ status: "timeout", timeoutMs });
         return;
       }
-      finish({
-        status: "error",
-        verified: false,
-        error: reviveError(msg.error),
-      });
+      finish({ status: "error", error: reviveError(msg.error) });
     });
 
     worker.on("error", (error: Error & { code?: string }) => {
       if (error.code === OOM_CODE) {
         finish({
           status: "out-of-memory",
-          verified: false,
           maxOldGenerationSizeMb: maxOldGenerationSizeMb ?? 0,
         });
         return;
       }
-      finish({ status: "error", verified: false, error });
+      finish({ status: "error", error });
     });
 
     worker.on("exit", (code) => {
       if (code !== 0) {
         finish({
           status: "error",
-          verified: false,
           error: new Error(`worker exited with code ${code}`),
         });
       }
