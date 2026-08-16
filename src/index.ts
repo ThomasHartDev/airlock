@@ -24,20 +24,19 @@ export {
 } from "./limits.js";
 export type { ResourceLimits, OutputSizeCheck } from "./limits.js";
 export {
-  serializeError,
-  toJsonResult,
-  exitCodeFor,
-  stringifyJsonResult,
-  compileAssertExpr,
-  runSource,
-  runFile,
-} from "./run-file.js";
+  THREAT_SCENARIOS,
+  RESIDUAL_RISKS,
+  ENV_CANARY,
+  ENV_CANARY_VALUE,
+  threatsByClass,
+} from "./threats.js";
 export type {
-  JsonError,
-  JsonRunResult,
+  ThreatClass,
+  ThreatScenario,
+  ResidualRisk,
   ExecutorTier,
-  RunFileOptions,
-} from "./run-file.js";
+  ContainmentExpectation,
+} from "./threats.js";
 export type {
   Assertion,
   RunResult,
