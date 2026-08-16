@@ -12,6 +12,9 @@
       "import": "./dist/index.js"
     }
   },
+  "bin": {
+    "airlock": "./dist/cli.js"
+  },
   "files": [
     "dist"
   ],
@@ -29,8 +32,7 @@
     "untrusted-code",
     "agent-safety",
     "capability-security",
-    "docker",
-    "container-isolation",
+    "cli",
     "typescript"
   ],
   "license": "MIT",
