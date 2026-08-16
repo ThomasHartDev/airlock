@@ -26,7 +26,7 @@ describe("runInWorker", () => {
       assert: (v) => v === 42,
     });
 
-    expect(result).toEqual({ status: "assertion-failed", value: 41 });
+    expect(result).toEqual({ status: "assertion-failed", verified: false, value: 41 });
     expect(isVerified(result)).toBe(false);
   });
 
@@ -77,7 +77,7 @@ describe("runInWorker", () => {
       assert: () => true,
     });
 
-    expect(result).toEqual({ status: "timeout", timeoutMs: 100 });
+    expect(result).toEqual({ status: "timeout", verified: false, timeoutMs: 100 });
   });
 
   it("times out on an async task that never settles", async () => {
@@ -86,7 +86,7 @@ describe("runInWorker", () => {
       assert: () => true,
     });
 
-    expect(result).toEqual({ status: "timeout", timeoutMs: 100 });
+    expect(result).toEqual({ status: "timeout", verified: false, timeoutMs: 100 });
   });
 
   it("aborts when the caller's signal fires", async () => {
@@ -100,7 +100,7 @@ describe("runInWorker", () => {
     controller.abort(reason);
 
     const result = await pending;
-    expect(result).toEqual({ status: "error", error: reason });
+    expect(result).toEqual({ status: "error", verified: false, error: reason });
   });
 
   it.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY])(

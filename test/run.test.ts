@@ -21,7 +21,7 @@ describe("runVerified", () => {
       assert: (v) => v === 42,
     });
 
-    expect(result).toEqual({ status: "assertion-failed", value: 41 });
+    expect(result).toEqual({ status: "assertion-failed", verified: false, value: 41 });
     expect(isVerified(result)).toBe(false);
   });
 
@@ -50,7 +50,7 @@ describe("runVerified", () => {
       { timeoutMs: 10, assert: () => true },
     );
 
-    expect(result).toEqual({ status: "timeout", timeoutMs: 10 });
+    expect(result).toEqual({ status: "timeout", verified: false, timeoutMs: 10 });
     expect(aborted).toBe(true);
   });
 
@@ -63,7 +63,7 @@ describe("runVerified", () => {
       { timeoutMs: 100, assert: () => true },
     );
 
-    expect(result).toEqual({ status: "error", error: boom });
+    expect(result).toEqual({ status: "error", verified: false, error: boom });
   });
 
   it("treats a throwing assertion as an error", async () => {

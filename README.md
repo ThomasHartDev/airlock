@@ -4,14 +4,16 @@ Ephemeral, zero-credential, self-verifying execution for untrusted or agent-writ
 
 ## What this demonstrates
 
-An airlock is the safe way to run code you do not trust: an LLM-generated snippet, a plugin, a user-submitted function. This repo builds that primitive from the ground up in TypeScript. The guarantee is that a caller never reads an output unless the run stayed inside its resource ceilings and its output satisfies a post-condition the caller supplied. Untrusted code is guilty until proven correct, and the type system makes you prove it before you can touch the value.
+An airlock is the safe way to run code you do not trust: an LLM-generated snippet, a plugin, a user-submitted function. This repo builds that primitive from the ground up in TypeScript. The guarantee is that a caller never reads an output as trusted unless the run stayed inside its resource ceilings and its output satisfies a post-condition the caller supplied. Untrusted code is guilty until proven correct, and the type system makes you prove it before you can touch a verified value.
 
-The first slice was the contract and the in-process runner that enforces it. The second slice added `run(code, opts)`, which executes untrusted source in a fresh `node:vm` context with no ambient authority. The third slice added `runInWorker(code, opts)`: the same contract on a `worker_threads` isolate with frozen globals and an empty env. The fourth slice hardens the **resource limit** layer: wall-clock deadline with hard terminate on abort, V8 heap cap, and output size caps. The fifth slice adds a **deny-by-default module loader**. This slice adds the **Docker-backed tier**: `runInDocker(code, opts)` runs the same contract inside a container with `--network=none`, a read-only root filesystem, dropped capabilities, and no host env, so an escape from the V8 realm still cannot reach the host's network, credentials, or writable disk.
+The first slice was the contract and the in-process runner that enforces it. The second slice added `run(code, opts)`, which executes untrusted source in a fresh `node:vm` context with no ambient authority. The third slice added `runInWorker(code, opts)`: the same contract on a `worker_threads` isolate with frozen globals and an empty env. The fourth slice hardens the **resource limit** layer: wall-clock deadline with hard terminate on abort, V8 heap cap, and output size caps. The fifth slice adds a **deny-by-default module loader**: untrusted code has no `require` unless the caller opts in with `allowedModules`. This slice makes **self-verification** explicit: every result carries a literal `verified: true | false`, and `verified: true` is returned only when the caller-supplied assertion passes. Later slices add a Docker-backed tier and a growing suite of documented escape-attempt tests.
 
 ## Concepts demonstrated
 
-- **Verification-gated results.** The output value is reachable only through the `ok` variant of a discriminated union, so an unverified run is unrepresentable at the call site.
-- **Post-condition contracts.** A run is trusted when a caller-supplied assertion holds over its output, a design-by-contract style check applied to untrusted code.
+- **Self-verification.** Execution and verification are separate phases. A pure `selfVerify` post-condition tags a produced value as trusted only when a caller-supplied assertion holds; runners return `verified: true` exclusively on that path.
+- **Verification-gated results.** Every `RunResult` arm carries a literal `verified: true | false`. The trusted value is reachable only through the `ok` + `verified: true` arm of a discriminated union, so an unverified run cannot be treated as success at the type level.
+- **Post-condition contracts.** A run is trusted when a caller-supplied assertion holds over its output, a design-by-contract style check applied to untrusted code. Assertions may return a boolean or `{ pass, reason? }` for diagnostic refusal reasons.
+- **Predicate composition.** `allAssertions` (conjunction) and `anyAssertion` (disjunction) build compound post-conditions without re-running the untrusted task.
 - **Deadline enforcement with cooperative cancellation.** An internal timer races the task and aborts the `AbortSignal` it runs under, composed with any caller-owned signal.
 - **Hard preemption via worker termination.** On the isolate tier, the wall-clock deadline and caller abort both call `worker.terminate()`, reclaiming the OS thread instead of abandoning a hung task.
 - **Resource isolation and ceilings.** Three independent budgets gate every run: wall-clock time, V8 old-generation heap (`maxOldGenerationSizeMb`), and measured UTF-8 output size (`maxOutputBytes`). Each maps to a distinct result status (`timeout`, `out-of-memory`, `output-too-large`).
@@ -26,18 +28,18 @@ The first slice was the contract and the in-process runner that enforces it. The
 - **Deny-by-default module loading.** `require` is unbound unless the caller sets `allowedModules`. An empty list injects a gate that refuses every specifier; a non-empty list is an exact-match allowlist (with bare/`node:` equivalence), never a prefix grant.
 - **Capability allowlists.** Module loading is treated as ambient authority: the host's real `require` is reachable only after the gate admits the id, so unlisted builtins like `fs` stay closed even when a sibling id is granted.
 - **Path-specifier refusal.** Relative and absolute paths are dropped from the allowlist and rejected at load time so filesystem resolution cannot re-open host I/O through a crafty entry.
-- **OS-level container isolation.** `runInDocker` uses Linux namespaces and cgroups (`--network=none`, `--read-only` + tmpfs, `--cap-drop=ALL`, `no-new-privileges`, non-root uid) behind the same `RunResult` contract as the vm and worker tiers.
-- **Escape-attempt tests as documentation.** Host env, outbound connect, write outside tmpfs, and host-only marker paths pin what the container tier blocks.
 - **Strict TypeScript.** `strict`, `noUncheckedIndexedAccess`, and `exactOptionalPropertyTypes`, no `any`.
 
 ## The primitive contract
 
 ```
 runVerified(task, { timeoutMs, assert, signal?, maxOutputBytes? }) -> RunResult
+selfVerify(value, assert) -> { verified: true, value } | { verified: false, value, reason? }
 ```
 
-- The value is returned **only** as `{ status: "ok", value, durationMs }`, and only when the task finished before `timeoutMs`, the payload stayed under `maxOutputBytes` when set, and `assert(value)` returned true.
-- Every other outcome is an explicit refusal: `timeout`, `assertion-failed` (carries the value for diagnostics, never as trusted), `output-too-large`, `out-of-memory`, or `error`.
+- The value is trusted **only** as `{ status: "ok", verified: true, value, durationMs }`, and only when the task finished before `timeoutMs`, the payload stayed under `maxOutputBytes` when set, and `assert(value)` passed.
+- Every other outcome is an explicit refusal with `verified: false`: `timeout`, `assertion-failed` (carries the value and optional `reason` for diagnostics, never as trusted), `output-too-large`, `out-of-memory`, or `error`.
+- `isVerified(result)` narrows on the literal `verified: true` arm so callers cannot read a trusted value without a type-level proof.
 - The task is handed an `AbortSignal` that fires on the deadline or on the caller's own signal, so well-behaved async work can stop early. On the worker tier that same abort path also terminates the isolate.
 
 The in-process tier cannot preempt code that blocks the event loop with a synchronous spin; that is what the isolate and container tiers are for. This tier defines the contract those tiers implement.
@@ -45,7 +47,7 @@ The in-process tier cannot preempt code that blocks the event loop with a synchr
 ## Usage
 
 ```ts
-import { runVerified, isVerified } from "airlock";
+import { runVerified, isVerified, allAssertions, selfVerify } from "airlock";
 
 const result = await runVerified(
   async (signal) => {
@@ -55,15 +57,26 @@ const result = await runVerified(
   {
     timeoutMs: 2000,
     maxOutputBytes: 64 * 1024,
-    assert: (data) => Number.isInteger(data.total) && data.total >= 0,
+    assert: allAssertions(
+      (data) => Number.isInteger(data.total),
+      (data) =>
+        data.total >= 0
+          ? { pass: true }
+          : { pass: false, reason: "total must be non-negative" },
+    ),
   },
 );
 
 if (isVerified(result)) {
+  // result.verified is literally true here
   console.log("trusted output:", result.value.total);
 } else {
-  console.warn("refused:", result.status);
+  console.warn("refused:", result.status, result.verified); // always false
 }
+
+// Pure re-check of an already-produced value (no re-execution):
+const check = await selfVerify({ total: 3 }, (d) => d.total > 0);
+// check.verified === true
 ```
 
 To run untrusted **source code** instead of a trusted closure, use `run`. The code executes with no ambient authority, so `process`, `require`, `fetch`, and timers are all undefined inside it. Any capability it needs is passed explicitly through `grant`:
@@ -151,26 +164,6 @@ await run("require('path')", {
 // -> { status: "error", error: ModuleNotAllowedError }
 ```
 
-For the strongest isolation tier, `runInDocker` runs the same source in a disposable container with no network, a read-only rootfs, dropped caps, and no host env. Requires Docker (default image `node:20-alpine`).
-
-**Wire format.** Grants still enter the guest as JSON (functions/symbols/bigints are refused before spawn). **Return values** leave the guest via `node:v8` `serialize` / host `deserialize` (structured clone), framed on stdout as `AIRLOCK1:<base64>`. That preserves `NaN`, `Infinity`, `Map`, `Set`, `Date`, and `TypedArray` the same way `runInWorker` does. Values that are not structured-cloneable fail closed as `{ status: "error" }` rather than a corrupted `ok`. There is no `allowedModules` on this tier: the guest has no `require` binding (escapes that reach the Node realm still run under the container posture only).
-
-`timeoutMs` is wall-clock from Docker CLI spawn and includes cold image start. `maxMemoryMb` sets the container cgroup memory ceiling; on OOM the result reuses the shared `maxOldGenerationSizeMb` field for `RunResult` parity (it is the cgroup ceiling, not a V8 old-gen limit).
-
-```ts
-import { runInDocker, isVerified, dockerSecurityArgs } from "airlock";
-
-console.log(dockerSecurityArgs({ maxMemoryMb: 128 })); // --network=none, --read-only, ...
-
-const result = await runInDocker<number>("rows.reduce((s, r) => s + r.n, 0)", {
-  timeoutMs: 30_000,
-  assert: (total) => total === 6,
-  grant: { rows: [{ n: 1 }, { n: 2 }, { n: 3 }] },
-  maxMemoryMb: 128,
-});
-if (isVerified(result)) console.log("verified:", result.value); // 6
-```
-
 ## Develop
 
 ```bash
@@ -187,4 +180,4 @@ pnpm run build
 - `src/worker.ts`: `runInWorker(code, opts)` runs untrusted source in a `worker_threads` isolate started with an empty `process.env` and frozen globals, caps the heap with `maxOldGenerationSizeMb` (reported as `out-of-memory`), and hard-kills the thread on the deadline so a sync spin and a never-settling async task are both preempted. An escape-attempt test confirms the constructor walk that reaches the host realm in-process reaches only the credential-free worker realm here.
 - `src/limits.ts`: shared resource ceilings for every tier. Wall-clock timeout aborts the task signal and, on the worker tier, calls `worker.terminate()` on both deadline and caller abort. Heap cap via V8 `resourceLimits`. Output size caps (`maxOutputBytes`) measure UTF-8 payload with a budgeted walk (cycle-safe, early-exit) and refuse with `output-too-large` before the post-condition runs.
 - `src/modules.ts`: deny-by-default module loader with an explicit `allowedModules` allowlist. Omitted means no `require`; `[]` or a list injects `createGatedRequire` over the host/worker require. Exact match only (bare and `node:` equivalent), path specifiers always refused, and the gate wins over a grant-supplied `require`. Wired into both `run` and `runInWorker`.
-- `src/docker.ts`: `runInDocker(code, opts)` runs untrusted source behind the same `RunResult` interface inside Docker with `--network=none`, `--read-only` (+ tmpfs `/tmp`), `--cap-drop=ALL`, `no-new-privileges`, and uid `65534`. Host env is not inherited. Named containers are force-removed on abort/timeout so guests cannot orphan. Host-collected stdout is byte-capped. Return values use a framed `v8.serialize` channel (`AIRLOCK1:<base64>`) so structured-clone types match worker fidelity; non-cloneable values fail closed. `dockerSecurityArgs` exposes the posture for audit. Tests cover the contract, value fidelity (NaN/Map/Uint8Array/Date), cgroup OOM, and isolation escapes. Live tests skip when the daemon is unavailable.
+- Self-verification: run a supplied assertion, return `verified: true` only if it passes. `src/verify.ts` owns the pure post-condition phase (`selfVerify`, `allAssertions` / `anyAssertion`, structured `{ pass, reason? }` outcomes). Every `RunResult` arm carries a literal `verified` flag; `isVerified` narrows on `verified: true`. Wired through `runVerified`, `run`, and `runInWorker`.
